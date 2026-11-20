@@ -969,6 +969,19 @@ impl AppCore {
                     if pending.clear_implicit_shader || entry.spec.shader.is_some() {
                         entry.spec.shader = None;
                     }
+                    // With no shader, auxiliary textures have no consumer — release
+                    // every pool ref and drop the spec entries, otherwise a stale
+                    // `u_depth`-style matte stays pinned in VRAM forever. Any
+                    // texture explicitly re-added in this same apply is re-inserted
+                    // by the texture_updates loop below.
+                    if let Some(gl) = gl_opt {
+                        for (_, old_id) in std::mem::take(&mut entry.custom_textures) {
+                            self.texture_pool.release(gl, old_id);
+                        }
+                    } else {
+                        entry.custom_textures.clear();
+                    }
+                    entry.spec.textures.clear();
                     sh_changed = true;
                 }
                 StagedShader::Set { path, program } => {
@@ -1266,6 +1279,26 @@ impl AppCore {
                 }
 
                 self.outputs[idx].slot0_has_first_frame = true;
+
+                // A one-shot (non-animated) job publishes exactly one frame then
+                // its worker exits; keeping the MediaJob alive would pin the
+                // FrameMailbox's spare/pending pixel buffers (w*h*4 each) for the
+                // whole session. Drop it now that the frame is uploaded — the
+                // texture in slot0 is unaffected and generation guards already
+                // reject any stale events. Dropping (not stop()) avoids blocking
+                // the event loop on a worker that already finished.
+                if self.outputs[idx]
+                    .job
+                    .as_ref()
+                    .is_some_and(|j| j.generation == generation && !j.kind.is_animated())
+                {
+                    self.outputs[idx].job = None;
+                    // The dropped mailbox just freed multi-MB decoded-frame
+                    // buffers; glibc keeps that memory in its arena instead of
+                    // returning it to the OS, which shows up as a permanent RSS
+                    // growth per apply. malloc_trim releases the free top pages.
+                    unsafe { libc::malloc_trim(0) };
+                }
 
                 // If an atomic `apply` is still waiting on auxiliary textures, hold rendering
                 // until `try_commit_pending_apply` completes cleanly.

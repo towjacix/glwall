@@ -179,27 +179,49 @@ pub enum MediaEvent {
     },
 }
 
+/// Spawns an aux-texture decode on a helper thread. A panic inside the
+/// worker is converted into `AuxTextureError` so the daemon never leaves a
+/// `pending_apply`/`inflight_tex_decodes` entry stuck forever.
 pub fn decode_texture_async(key: TextureKey, sender: Sender<MediaEvent>) {
-    let _ = std::thread::Builder::new()
+    let spawn = std::thread::Builder::new()
         .name("glwall-tex".to_string())
-        .spawn(
-            move || match static_img::decode_rgba_image(&key.path, key.flip_y) {
-                Ok((width, height, pixels)) => {
-                    let _ = sender.send(MediaEvent::AuxTextureReady {
-                        key,
-                        width,
-                        height,
-                        pixels,
-                    });
+        .spawn({
+            let key = key.clone();
+            let sender = sender.clone();
+            move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    static_img::decode_rgba_image(&key.path, key.flip_y)
+                }));
+                match result {
+                    Ok(Ok((width, height, pixels))) => {
+                        let _ = sender.send(MediaEvent::AuxTextureReady {
+                            key,
+                            width,
+                            height,
+                            pixels,
+                        });
+                    }
+                    Ok(Err(err)) => {
+                        let _ = sender.send(MediaEvent::AuxTextureError {
+                            key,
+                            message: format!("{err}"),
+                        });
+                    }
+                    Err(_) => {
+                        let _ = sender.send(MediaEvent::AuxTextureError {
+                            key,
+                            message: "aux texture decode panicked".to_string(),
+                        });
+                    }
                 }
-                Err(err) => {
-                    let _ = sender.send(MediaEvent::AuxTextureError {
-                        key,
-                        message: format!("{err}"),
-                    });
-                }
-            },
-        );
+            }
+        });
+    if spawn.is_err() {
+        let _ = sender.send(MediaEvent::AuxTextureError {
+            key,
+            message: "failed to spawn aux texture decode thread".to_string(),
+        });
+    }
 }
 
 #[derive(Debug)]
@@ -327,6 +349,8 @@ impl MediaJob {
         sender: Sender<MediaEvent>,
     ) -> Self {
         let control = WorkerControl::new(initially_paused);
+        let panic_sender = sender.clone();
+        let panic_output = output.clone();
         let mailbox = FrameMailbox::new(sender, output, generation);
 
         let worker_control = Arc::clone(&control);
@@ -335,38 +359,57 @@ impl MediaJob {
 
         let handle = std::thread::Builder::new()
             .name("glwall-media".to_string())
-            .spawn(move || match kind {
-                MediaKind::ProceduralShader => {}
-                MediaKind::StaticImage => {
-                    static_img::run_static(&path_buf, &worker_control, &worker_mailbox);
-                }
-                MediaKind::FfmpegStaticImage => {
-                    static_img::run_ffmpeg_static(&path_buf, &worker_control, &worker_mailbox);
-                }
-                MediaKind::AnimatedGif => {
-                    static_img::run_animated_gif(
-                        &path_buf,
-                        fps_cap,
-                        &worker_control,
-                        &worker_mailbox,
-                    );
-                }
-                MediaKind::AnimatedWebp => {
-                    static_img::run_animated_webp(
-                        &path_buf,
-                        fps_cap,
-                        &worker_control,
-                        &worker_mailbox,
-                    );
-                }
-                MediaKind::Video => {
-                    video::run_video(
-                        &path_buf,
-                        hwaccel,
-                        fps_cap,
-                        &worker_control,
-                        &worker_mailbox,
-                    );
+            .spawn({
+                // If a decoder panics, synthesize a media Error so the daemon
+                // reverts/cancels cleanly instead of leaving `waiting_target_frame`
+                // and slot1/prev_job resources stuck forever.
+
+                move || {
+                    let run = move || match kind {
+                        MediaKind::ProceduralShader => {}
+                        MediaKind::StaticImage => {
+                            static_img::run_static(&path_buf, &worker_control, &worker_mailbox);
+                        }
+                        MediaKind::FfmpegStaticImage => {
+                            static_img::run_ffmpeg_static(
+                                &path_buf,
+                                &worker_control,
+                                &worker_mailbox,
+                            );
+                        }
+                        MediaKind::AnimatedGif => {
+                            static_img::run_animated_gif(
+                                &path_buf,
+                                fps_cap,
+                                &worker_control,
+                                &worker_mailbox,
+                            );
+                        }
+                        MediaKind::AnimatedWebp => {
+                            static_img::run_animated_webp(
+                                &path_buf,
+                                fps_cap,
+                                &worker_control,
+                                &worker_mailbox,
+                            );
+                        }
+                        MediaKind::Video => {
+                            video::run_video(
+                                &path_buf,
+                                hwaccel,
+                                fps_cap,
+                                &worker_control,
+                                &worker_mailbox,
+                            );
+                        }
+                    };
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).is_err() {
+                        let _ = panic_sender.send(MediaEvent::Error {
+                            output: panic_output,
+                            generation,
+                            message: "media worker panicked".to_string(),
+                        });
+                    }
                 }
             })
             .ok();
