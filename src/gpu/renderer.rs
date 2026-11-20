@@ -53,6 +53,7 @@ struct ProgramLocations {
     u_tex0_y: Option<glow::UniformLocation>,
     u_tex0_uv: Option<glow::UniformLocation>,
     u_slot0_kind: Option<glow::UniformLocation>,
+    u_slot0_framebuffer: Option<glow::UniformLocation>,
     u_slot0_size: Option<glow::UniformLocation>,
     u_slot0_fit: Option<glow::UniformLocation>,
     u_slot0_cs: Option<glow::UniformLocation>,
@@ -283,6 +284,7 @@ impl ProgramLocations {
                 u_slot0_size: gl.get_uniform_location(p, "u_slot0_size"),
                 u_slot0_fit: gl.get_uniform_location(p, "u_slot0_fit"),
                 u_slot0_cs: gl.get_uniform_location(p, "u_slot0_cs"),
+                u_slot0_framebuffer: gl.get_uniform_location(p, "u_slot0_framebuffer"),
                 u_tex1_rgba: gl.get_uniform_location(p, "u_tex1_rgba"),
                 u_tex1_y: gl.get_uniform_location(p, "u_tex1_y"),
                 u_tex1_uv: gl.get_uniform_location(p, "u_tex1_uv"),
@@ -784,6 +786,7 @@ struct SlotBinding {
     width: u32,
     height: u32,
     fit: FitMode,
+    framebuffer: bool,
     colorspace: ColorSpace,
     rgba_tex: Option<glow::Texture>,
     y_tex: Option<glow::Texture>,
@@ -824,6 +827,7 @@ impl MediaSlotGpu {
             height: self.height,
             fit: self.fit,
             colorspace: self.colorspace,
+            framebuffer: false,
             rgba_tex: self.rgba_tex.as_ref().map(|t| t.handle),
             y_tex: self.y_tex.as_ref().map(|t| t.handle),
             uv_tex: self.uv_tex.as_ref().map(|t| t.handle),
@@ -1084,6 +1088,7 @@ impl Renderer {
                 height: h,
                 fit: params.slot0.fit,
                 colorspace: params.slot0.colorspace,
+                framebuffer: true,
                 rgba_tex: Some(color_tex),
                 y_tex: None,
                 uv_tex: None,
@@ -1181,6 +1186,7 @@ impl Renderer {
                 params.params[3],
             );
             gl.uniform_1_i32(locs.u_output_index.as_ref(), params.output_index);
+            gl.uniform_1_i32(locs.u_slot0_framebuffer.as_ref(), slot0.framebuffer as i32);
 
             // Slot 0 -> texture units 0, 1, 2
             self.bind_slot(
@@ -1297,6 +1303,118 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallpaper_keeps_orientation_through_transition_with_postprocessing() {
+        let egl = crate::gpu::egl::EglState::new_test_pbuffer(8, 8).unwrap();
+        let gl = egl.create_glow_context().unwrap();
+        let mut renderer = Renderer::new(gl).unwrap();
+        let mut image = Vec::new();
+        for y in 0..8 {
+            for x in 0..8 {
+                image.extend_from_slice(match (y < 4, x < 4) {
+                    (true, true) => &[255, 0, 0, 255],
+                    (true, false) => &[0, 255, 0, 255],
+                    (false, true) => &[0, 0, 255, 255],
+                    (false, false) => &[255, 255, 0, 255],
+                });
+            }
+        }
+        let mut slot = MediaSlotGpu::empty();
+        slot.set_rgba(&renderer.gl, 8, 8, FitMode::Stretch, &image)
+            .unwrap();
+        let custom = GlProgram::compile(&renderer.gl, BUILTIN_PASSTHROUGH).unwrap();
+        let custom_uv = GlProgram::compile(
+            &renderer.gl,
+            "vec4 wallpaper(vec2 uv) { return texture(u_tex0_rgba, wallpaperUv(uv)); }",
+        )
+        .unwrap();
+        let shadertoy = GlProgram::compile(
+            &renderer.gl,
+            "void mainImage(out vec4 c, in vec2 p) { c = texture(iChannel0, p / iResolution.xy); }",
+        )
+        .unwrap();
+        let pool = TexturePool::new();
+        let textures = BTreeMap::new();
+        let uniforms = BTreeMap::new();
+        let mut failures = Vec::new();
+        for (name, source) in [
+            ("fade", crate::gpu::shader::BUILTIN_FADE),
+            ("dissolve", crate::gpu::shader::BUILTIN_DISSOLVE),
+            ("pixelate", crate::gpu::shader::BUILTIN_PIXELATE),
+            ("wipe", crate::gpu::shader::BUILTIN_WIPE),
+        ] {
+            let transition = GlProgram::compile(&renderer.gl, source).unwrap();
+            for (postprocess, program) in [
+                ("none", None),
+                ("sampleWallpaper", Some(&custom)),
+                ("wallpaperUv", Some(&custom_uv)),
+                ("iChannel0", Some(&shadertoy)),
+            ] {
+                for in_transition in [false, true] {
+                    for progress in [0.0, 0.5, 1.0] {
+                        let params = DrawParams {
+                            width: 8,
+                            height: 8,
+                            time_secs: 0.0,
+                            delta_secs: 0.0,
+                            progress,
+                            frame_index: 0,
+                            params: [0.0; 4],
+                            output_index: 0,
+                            output_name: "test",
+                            slot0: &slot,
+                            slot1: Some(&slot),
+                            custom_program: program,
+                            transition_program: Some(&transition),
+                            in_transition,
+                            custom_textures: &textures,
+                            custom_uniforms: &uniforms,
+                        };
+                        renderer.draw(&params, &pool).unwrap();
+                        let mut pixels = [0u8; 8 * 8 * 4];
+                        unsafe {
+                            renderer.gl.read_pixels(
+                                0,
+                                0,
+                                8,
+                                8,
+                                glow::RGBA,
+                                glow::UNSIGNED_BYTE,
+                                glow::PixelPackData::Slice(Some(&mut pixels)),
+                            );
+                        }
+                        // glReadPixels begins at the bottom-left.
+                        let pixel =
+                            |x: usize, y: usize| &pixels[(y * 8 + x) * 4..(y * 8 + x) * 4 + 4];
+                        let corners = [pixel(1, 6), pixel(6, 6), pixel(1, 1), pixel(6, 1)];
+                        if corners
+                            != [
+                                &[255, 0, 0, 255][..],
+                                &[0, 255, 0, 255][..],
+                                &[0, 0, 255, 255][..],
+                                &[255, 255, 0, 255][..],
+                            ]
+                        {
+                            failures.push(format!("{name} postprocess={postprocess} in_transition={in_transition} progress={progress}: {corners:?}"));
+                        }
+                    }
+                }
+            }
+            transition.destroy(&renderer.gl);
+        }
+        slot.destroy(&renderer.gl);
+        custom.destroy(&renderer.gl);
+        custom_uv.destroy(&renderer.gl);
+        shadertoy.destroy(&renderer.gl);
+        pool.destroy(&renderer.gl);
+        renderer.destroy();
+        assert!(
+            failures.is_empty(),
+            "orientation failures:\n{}",
+            failures.join("\n")
+        );
+    }
 
     fn test_key(name: &str, filter: TextureFilter) -> TextureKey {
         TextureKey {

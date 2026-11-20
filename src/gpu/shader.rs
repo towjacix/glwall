@@ -41,6 +41,8 @@ uniform int u_slot0_kind;
 uniform vec2 u_slot0_size;
 uniform int u_slot0_fit;
 uniform int u_slot0_cs;
+// An FBO texture has bottom-row-first coordinates, unlike decoded media.
+uniform int u_slot0_framebuffer;
 
 uniform sampler2D u_tex1_rgba;
 uniform sampler2D u_tex1_y;
@@ -132,6 +134,7 @@ vec4 glwall_sample_slot0(vec2 uv) {
     if (!glwall_fit_uv(uv, u_slot0_size, u_resolution, u_slot0_fit, texUv)) {
         return vec4(0.0, 0.0, 0.0, 1.0);
     }
+    if (u_slot0_framebuffer != 0) texUv.y = 1.0 - texUv.y;
     if (u_slot0_kind == 1) {
         return texture(u_tex0_rgba, texUv);
     }
@@ -166,7 +169,9 @@ vec4 samplePrevWallpaper(vec2 uv) {
 
 vec2 wallpaperUv(vec2 uv) {
     bool unusedInBounds;
-    return glwall_map_fit_uv(uv, u_slot0_size, u_resolution, u_slot0_fit, unusedInBounds);
+    vec2 mapped = glwall_map_fit_uv(uv, u_slot0_size, u_resolution, u_slot0_fit, unusedInBounds);
+    if (u_slot0_framebuffer != 0) mapped.y = 1.0 - mapped.y;
+    return mapped;
 }
 
 vec4 sampleTextureFitted(sampler2D tex, vec2 texSize, vec2 uv) {
@@ -220,6 +225,7 @@ pub fn is_builtin_uniform(name: &str) -> bool {
             | "u_slot0_size"
             | "u_slot0_fit"
             | "u_slot0_cs"
+            | "u_slot0_framebuffer"
             | "u_slot1_kind"
             | "u_slot1_size"
             | "u_slot1_fit"

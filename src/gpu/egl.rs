@@ -20,6 +20,55 @@ pub struct EglState {
 }
 
 impl EglState {
+    #[cfg(test)]
+    pub(crate) fn new_test_pbuffer(width: i32, height: i32) -> Result<Self> {
+        let lib = unsafe { libloading::Library::new("libEGL.so.1") }?;
+        let api = unsafe { EglInstance::load_required_from(lib) }?;
+        let egl15 = api.upcast::<egl::EGL1_5>().context("EGL 1.5 required")?;
+        let display = unsafe {
+            egl15.get_platform_display(
+                EGL_PLATFORM_SURFACELESS_MESA,
+                ptr::null_mut(),
+                &[egl::ATTRIB_NONE],
+            )
+        }?;
+        api.initialize(display)?;
+        api.bind_api(egl::OPENGL_ES_API)?;
+        let config = choose_single_config(
+            &api,
+            display,
+            &[
+                egl::SURFACE_TYPE,
+                egl::PBUFFER_BIT,
+                egl::RENDERABLE_TYPE,
+                egl::OPENGL_ES3_BIT,
+                egl::RED_SIZE,
+                8,
+                egl::GREEN_SIZE,
+                8,
+                egl::BLUE_SIZE,
+                8,
+                egl::ALPHA_SIZE,
+                8,
+                egl::NONE,
+            ],
+        )?;
+        let context = create_gles3_context(&api, display, config)?;
+        let surface = api.create_pbuffer_surface(
+            display,
+            config,
+            &[egl::WIDTH, width, egl::HEIGHT, height, egl::NONE],
+        )?;
+        api.make_current(display, Some(surface), Some(surface), Some(context))?;
+        Ok(Self {
+            api,
+            display,
+            config,
+            context,
+            fallback_pbuffer: Some(surface),
+        })
+    }
+
     pub fn new_wayland(wl_display_ptr: *mut c_void) -> Result<Self> {
         let lib = unsafe { libloading::Library::new("libEGL.so.1") }
             .context("failed to dynamically load libEGL.so.1")?;
