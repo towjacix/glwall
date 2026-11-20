@@ -1,0 +1,20 @@
+[tools]
+rust = "1.100.0"
+
+[tasks.build]
+description = "Build release binary"
+run = "cargo build --release --locked"
+
+[tasks.test]
+description = "Run unit tests and headless shader validation"
+run = """
+cargo test
+cargo run -- check-shader shaders/*.frag
+"""
+
+[tasks.lint]
+description = "Format check and clippy"
+run = """
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+"""

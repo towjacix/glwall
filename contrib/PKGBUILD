@@ -1,0 +1,24 @@
+# Maintainer: towjacix <manhp7658@gmail.com>
+pkgname=glwall-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Standalone Wayland OpenGL ES 3.0 / EGL live & custom-shader wallpaper daemon"
+arch=('x86_64')
+url="https://github.com/towjacix/glwall"
+license=('MIT')
+depends=('glibc' 'libglvnd' 'wayland')
+optdepends=(
+  'ffmpeg: hardware/software decoding for video wallpapers and AVIF/HEIF/JXL images'
+)
+provides=('glwall')
+conflicts=('glwall')
+source=("glwall-v${pkgver}-x86_64-linux.tar.zst::${url}/releases/download/v${pkgver}/glwall-v${pkgver}-x86_64-linux.tar.zst")
+sha256sums=('SKIP')
+
+package() {
+  install -Dm755 "${srcdir}/bin/glwall" "${pkgdir}/usr/bin/glwall"
+  install -d "${pkgdir}/usr/share/glwall/shaders"
+  install -Dm644 "${srcdir}"/share/glwall/shaders/*.frag "${pkgdir}/usr/share/glwall/shaders/"
+  install -Dm644 "${srcdir}/share/systemd/user/glwall.service" "${pkgdir}/usr/lib/systemd/user/glwall.service"
+  install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

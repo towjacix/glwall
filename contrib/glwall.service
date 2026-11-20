@@ -1,0 +1,19 @@
+[Unit]
+Description=glwall — Wayland OpenGL ES 3.0 / EGL live & custom-shader wallpaper daemon
+Documentation=https://github.com/towjacix/glwall
+PartOf=hyprland-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/glwall daemon
+ExecReload=%h/.local/bin/glwall reload
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+MemoryMax=512M
+NoNewPrivileges=true
+SyslogIdentifier=glwall
+
+[Install]
+WantedBy=hyprland-session.target

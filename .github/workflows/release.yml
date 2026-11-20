@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+
+      - name: Install build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev \
+            libegl-dev \
+            libgl-dev \
+            libgbm-dev \
+            libgles2-mesa-dev \
+            libegl-mesa0 \
+            libgles2 \
+            libgl1-mesa-dri \
+            pkg-config \
+            zstd \
+            ffmpeg
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Verify minimal dynamic library linkage
+        run: |
+          ldd target/release/glwall
+          if ldd target/release/glwall | grep -qE 'libavcodec|libEGL|libwayland-client'; then
+            echo "ERROR: release binary must not hard-link libavcodec, libEGL, or libwayland-client"
+            exit 1
+          fi
+
+      - name: Validate bundled shaders on headless Mesa EGL
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: ./target/release/glwall check-shader shaders/*.frag
+
+      - name: Package release archive and SHA256SUMS
+        run: |
+          TAG="${GITHUB_REF_NAME:-dev}"
+          STAGE="dist/stage"
+          ARCHIVE="glwall-${TAG}-x86_64-linux.tar.zst"
+          mkdir -p "${STAGE}/bin" "${STAGE}/share/glwall/shaders" "${STAGE}/share/systemd/user"
+          cp target/release/glwall "${STAGE}/bin/glwall"
+          chmod 0755 "${STAGE}/bin/glwall"
+          cp shaders/*.frag "${STAGE}/share/glwall/shaders/"
+          cp contrib/glwall.service "${STAGE}/share/systemd/user/glwall.service"
+          cp README.md LICENSE "${STAGE}/"
+          mkdir -p dist/out
+          tar -C "${STAGE}" --zstd -cf "dist/out/${ARCHIVE}" .
+          (cd dist/out && sha256sum "${ARCHIVE}" > SHA256SUMS)
+          ls -lh dist/out
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/out/*.tar.zst
+            dist/out/SHA256SUMS
+          generate_release_notes: true
