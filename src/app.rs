@@ -112,6 +112,16 @@ impl PendingApply {
     }
 }
 
+fn frame_needs_render(
+    configured: bool,
+    frame_pending: bool,
+    dirty: bool,
+    continuous: bool,
+    apply_pending: bool,
+) -> bool {
+    configured && !frame_pending && !apply_pending && (dirty || continuous)
+}
+
 struct CommitWaiter {
     client_id: IpcClientId,
     revision_targets: Vec<(String, u64)>,
@@ -1404,12 +1414,17 @@ impl AppCore {
         qh: &wayland_client::QueueHandle<WaylandContext<Self>>,
     ) {
         let entry = &self.outputs[idx];
-        if !entry.surface.configured || entry.surface.frame_pending {
-            return;
-        }
         let paused = self.pause.is_paused(&entry.name);
         let continuous = !paused && entry.uses_continuous_frames();
-        if !entry.surface.dirty && !continuous {
+        // Preserve the last committed surface while the replacement media or
+        // its auxiliary textures are still being staged.
+        if !frame_needs_render(
+            entry.surface.configured,
+            entry.surface.frame_pending,
+            entry.surface.dirty,
+            continuous,
+            entry.pending_apply.is_some(),
+        ) {
             return;
         }
 
@@ -2321,4 +2336,23 @@ pub fn run_daemon(
     drop(ctx);
     let _ = fs::remove_file(&socket_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frame_needs_render;
+
+    #[test]
+    fn pending_wallpaper_keeps_previous_frame_until_commit() {
+        // A newly started video requests continuous frames before decode is ready.
+        assert!(!frame_needs_render(true, false, false, true, true));
+        // Damage or a surface reconfiguration must not expose the empty slot either.
+        assert!(!frame_needs_render(true, false, true, true, true));
+        // Once the target frame is committed, the transition may render.
+        assert!(frame_needs_render(true, false, true, true, false));
+        // Normal frame throttling remains in force.
+        assert!(!frame_needs_render(true, true, true, true, false));
+        assert!(!frame_needs_render(false, false, true, true, false));
+        assert!(!frame_needs_render(true, false, false, false, false));
+    }
 }

@@ -1,5 +1,5 @@
 [tools]
-rust = { version = "1.100.0", profile = "minimal", components = "clippy,rustfmt" }
+rust = { version = "1.100.0", profile = "minimal", components = "clippy,rustfmt,rust-analyzer" }
 
 [tasks.build]
 description = "Build release binary"
