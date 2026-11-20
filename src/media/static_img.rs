@@ -12,14 +12,16 @@ use image::codecs::webp::WebPDecoder;
 use super::{FrameMailbox, FramePayload, WorkerControl};
 
 pub fn decode_rgba_image(path: &Path, flip_y: bool) -> Result<(u32, u32, Vec<u8>)> {
-    let is_ffmpeg_ext = path.extension().and_then(|s| s.to_str()).is_some_and(|e| {
-        matches!(
-            e.to_ascii_lowercase().as_str(),
-            "avif" | "heif" | "heic" | "jxl"
-        )
+    let use_ffmpeg = path.extension().and_then(|s| s.to_str()).is_some_and(|e| {
+        let e = e.to_ascii_lowercase();
+        // Formats the image crate cannot decode at all.
+        matches!(e.as_str(), "avif" | "heif" | "heic" | "jxl")
+            // Progressive JPEGs decode vertically flipped via zune-jpeg (the
+            // image crate's jpeg backend) - route them through ffmpeg instead.
+            || matches!(e.as_str(), "jpg" | "jpeg") && is_progressive_jpeg(path)
     });
 
-    let (w, h, mut pixels) = if is_ffmpeg_ext {
+    let (w, h, mut pixels) = if use_ffmpeg {
         decode_ffmpeg_static_rgba(path)?
     } else {
         let img = image::open(path)
@@ -33,6 +35,63 @@ pub fn decode_rgba_image(path: &Path, flip_y: bool) -> Result<(u32, u32, Vec<u8>
         flip_rgba_vertical(w, h, &mut pixels);
     }
     Ok((w, h, pixels))
+}
+
+/// True when the JPEG's start-of-frame marker is a progressive variant
+/// (SOF1/SOF2/SOF3 and their arithmetic/differential forms), which the
+/// image crate's zune-jpeg backend renders upside down on some inputs.
+fn is_progressive_jpeg(path: &Path) -> bool {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    use std::io::Read;
+    // SOI + a handful of headers is plenty: SOF appears before any scan data.
+    let mut head = [0u8; 65536];
+    let n = file.read(&mut head).unwrap_or(0);
+    let d = &head[..n];
+    if d.len() < 4 || d[0] != 0xFF || d[1] != 0xD8 {
+        return false;
+    }
+    let mut i = 2;
+    while i + 3 < d.len() {
+        // Skip fill bytes then require a marker introducer.
+        if d[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = d[i + 1];
+        if marker == 0xFF {
+            i += 1;
+            continue;
+        }
+        // Standalone markers without a length field.
+        if matches!(marker, 0x01 | 0xD8 | 0xD9 | 0xD0..=0xD7) {
+            i += 2;
+            continue;
+        }
+        if matches!(
+            marker,
+            0xC1 | 0xC2 | 0xC3 | 0xC5 | 0xC6 | 0xC7 | 0xC9 | 0xCA | 0xCB | 0xCD | 0xCE | 0xCF
+        ) {
+            return true;
+        }
+        // SOF0 baseline - not progressive. (0xC4 DHT, 0xC8/0xCC are not SOF
+        // markers; they carry a length and fall through to the skip below.)
+        if marker == 0xC0 {
+            return false;
+        }
+        // SOS (0xDA) begins scan data - no later SOF marker exists.
+        if marker == 0xDA {
+            return false;
+        }
+        let seg_len = u16::from_be_bytes([d[i + 2], d[i + 3]]) as usize;
+        if seg_len < 2 {
+            return false;
+        }
+        i += 2 + seg_len;
+    }
+    false
 }
 
 fn flip_rgba_vertical(width: u32, height: u32, pixels: &mut [u8]) {
