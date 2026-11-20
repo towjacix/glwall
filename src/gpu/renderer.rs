@@ -419,7 +419,15 @@ impl OwnedTexture {
     }
 
     fn destroy(self, gl: &glow::Context) {
-        unsafe { gl.delete_texture(self.handle) };
+        unsafe {
+            gl.delete_texture(self.handle);
+            // glDeleteTexture only *marks* the object for deletion; the NVIDIA
+            // driver defers the actual free until the next command submission.
+            // Since destroys usually happen on the apply path (no draw follows
+            // immediately), flush so the deferred free is processed now and
+            // the backing memory actually leaves the process.
+            gl.flush();
+        }
     }
 }
 
