@@ -52,7 +52,7 @@ uniform int u_slot1_cs;
 
 uniform sampler2D iChannel0;
 
-bool glwall_fit_uv(vec2 uv, vec2 srcSize, vec2 dstSize, int fitMode, out vec2 outUv) {
+vec2 glwall_map_fit_uv(vec2 uv, vec2 srcSize, vec2 dstSize, int fitMode, out bool inBounds) {
     vec2 safeSrc = max(srcSize, vec2(1.0));
     vec2 safeDst = max(dstSize, vec2(1.0));
     vec2 rel = uv;
@@ -80,13 +80,19 @@ bool glwall_fit_uv(vec2 uv, vec2 srcSize, vec2 dstSize, int fitMode, out vec2 ou
     }
     // fitMode == 2 is Stretch (rel == uv)
 
-    if (rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0) {
+    inBounds = !(rel.x < 0.0 || rel.x > 1.0 || rel.y < 0.0 || rel.y > 1.0);
+    // Textures uploaded top-row-first place row 0 at v = 0, so flip Y for screen-up orientation.
+    return vec2(rel.x, 1.0 - rel.y);
+}
+
+bool glwall_fit_uv(vec2 uv, vec2 srcSize, vec2 dstSize, int fitMode, out vec2 outUv) {
+    bool inBounds;
+    vec2 mapped = glwall_map_fit_uv(uv, srcSize, dstSize, fitMode, inBounds);
+    if (!inBounds) {
         outUv = vec2(0.0);
         return false;
     }
-
-    // Textures uploaded top-row-first place row 0 at v = 0, so flip Y for screen-up orientation.
-    outUv = vec2(rel.x, 1.0 - rel.y);
+    outUv = mapped;
     return true;
 }
 
@@ -157,6 +163,19 @@ vec4 sampleWallpaper(vec2 uv) {
 vec4 samplePrevWallpaper(vec2 uv) {
     return glwall_sample_slot1(uv);
 }
+
+vec2 wallpaperUv(vec2 uv) {
+    bool unusedInBounds;
+    return glwall_map_fit_uv(uv, u_slot0_size, u_resolution, u_slot0_fit, unusedInBounds);
+}
+
+vec4 sampleTextureFitted(sampler2D tex, vec2 texSize, vec2 uv) {
+    vec2 texUv;
+    if (!glwall_fit_uv(uv, texSize, u_resolution, u_slot0_fit, texUv)) {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+    return texture(tex, texUv);
+}
 "#;
 
 const SHADERTOY_MAIN_WRAPPER: &str = r#"
@@ -185,6 +204,40 @@ pub struct AssembledShader {
     pub uses_time: bool,
     pub uses_ichannel0: bool,
     pub fragment_source: String,
+}
+
+pub fn is_builtin_uniform(name: &str) -> bool {
+    matches!(
+        name,
+        "u_resolution"
+            | "u_time"
+            | "u_delta"
+            | "u_progress"
+            | "u_frame"
+            | "u_params"
+            | "u_output_index"
+            | "u_slot0_kind"
+            | "u_slot0_size"
+            | "u_slot0_fit"
+            | "u_slot0_cs"
+            | "u_slot1_kind"
+            | "u_slot1_size"
+            | "u_slot1_fit"
+            | "u_slot1_cs"
+    )
+}
+
+pub fn is_builtin_sampler(name: &str) -> bool {
+    matches!(
+        name,
+        "u_tex0_rgba"
+            | "u_tex0_y"
+            | "u_tex0_uv"
+            | "u_tex1_rgba"
+            | "u_tex1_y"
+            | "u_tex1_uv"
+            | "iChannel0"
+    )
 }
 
 pub fn resolve_transition_source(name_or_path: &str) -> Result<Option<String>> {

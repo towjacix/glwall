@@ -225,11 +225,11 @@ impl EglState {
         Ok(())
     }
 
-    pub fn make_current_surfaceless(&self) {
+    pub fn make_current_surfaceless(&self) -> Result<()> {
         let surf = self.fallback_pbuffer;
-        let _ = self
-            .api
-            .make_current(self.display, surf, surf, Some(self.context));
+        self.api
+            .make_current(self.display, surf, surf, Some(self.context))
+            .context("eglMakeCurrent (surfaceless) failed")
     }
 
     pub fn unbind_context(&self) {

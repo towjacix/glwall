@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{FitArg, HwAccelArg};
+use crate::gpu::uniforms::{TextureSpec, UniformValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -104,6 +105,8 @@ pub struct OutputSpec {
     pub params: [f32; 4],
     pub fps: Option<f32>,
     pub hwaccel: HwAccel,
+    pub textures: BTreeMap<String, TextureSpec>,
+    pub uniforms: BTreeMap<String, UniformValue>,
 }
 
 impl Default for OutputSpec {
@@ -117,6 +120,8 @@ impl Default for OutputSpec {
             params: [0.0; 4],
             fps: None,
             hwaccel: HwAccel::Auto,
+            textures: BTreeMap::new(),
+            uniforms: BTreeMap::new(),
         }
     }
 }
@@ -132,6 +137,12 @@ pub struct OutputConfig {
     pub params: Option<[f32; 4]>,
     pub fps: Option<f32>,
     pub hwaccel: Option<HwAccel>,
+    pub textures: BTreeMap<String, TextureSpec>,
+    pub uniforms: BTreeMap<String, UniformValue>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,6 +152,8 @@ pub struct Config {
     pub default_transition: String,
     pub default_transition_ms: u32,
     pub auto_pause_fullscreen: bool,
+    #[serde(default = "default_true")]
+    pub persist_state: bool,
     pub fps_cap: Option<f32>,
     pub hwaccel: HwAccel,
     pub outputs: HashMap<String, OutputConfig>,
@@ -153,6 +166,7 @@ impl Default for Config {
             default_transition: "fade".to_string(),
             default_transition_ms: 450,
             auto_pause_fullscreen: true,
+            persist_state: true,
             fps_cap: None,
             hwaccel: HwAccel::Auto,
             outputs: HashMap::new(),
@@ -184,6 +198,8 @@ impl Config {
             params: [0.0; 4],
             fps: self.fps_cap,
             hwaccel: self.hwaccel,
+            textures: BTreeMap::new(),
+            uniforms: BTreeMap::new(),
         };
         if let Some(cfg) = self.outputs.get("*").or_else(|| self.outputs.get(output)) {
             apply_output_config(&mut spec, cfg);
@@ -221,6 +237,12 @@ fn apply_output_config(spec: &mut OutputSpec, cfg: &OutputConfig) {
     }
     if let Some(hw) = cfg.hwaccel {
         spec.hwaccel = hw;
+    }
+    for (name, tex) in &cfg.textures {
+        spec.textures.insert(name.clone(), tex.clone());
+    }
+    for (name, val) in &cfg.uniforms {
+        spec.uniforms.insert(name.clone(), val.clone());
     }
 }
 
@@ -294,6 +316,7 @@ pub fn default_state_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::uniforms::{TextureFilter, TextureWrap};
 
     #[test]
     fn config_parses_defaults_and_overrides() {
@@ -302,37 +325,86 @@ default_fit = "contain"
 default_transition = "dissolve"
 default_transition_ms = 600
 auto_pause_fullscreen = false
+persist_state = false
 fps_cap = 60.0
 hwaccel = "cuda"
 
 [outputs."*"]
 params = [0.2, 0.4, 0.6, 0.8]
 
+[outputs."*".uniforms]
+u_parallaxStrength = 0.04
+u_pointer = [0.5, 0.5]
+
 [outputs."DP-1"]
 fit = "stretch"
 transition = "wipe"
+
+[outputs."DP-1".textures.u_depth]
+path = "/tmp/depth.png"
+filter = "linear"
+wrap = "clamp_to_edge"
+flip_y = false
+
+[outputs."DP-1".uniforms]
+u_pointer = [0.8, 0.2]
 "#;
         let cfg: Config = toml::from_str(toml_src).unwrap();
         assert!(!cfg.auto_pause_fullscreen);
+        assert!(!cfg.persist_state);
         let dp1 = cfg.base_spec_for("DP-1");
         assert_eq!(dp1.fit, FitMode::Stretch);
         assert_eq!(dp1.transition, "wipe");
         assert_eq!(dp1.params, [0.2, 0.4, 0.6, 0.8]);
         assert_eq!(dp1.hwaccel, HwAccel::Cuda);
+        assert_eq!(
+            dp1.uniforms.get("u_parallaxStrength"),
+            Some(&UniformValue::Float(0.04))
+        );
+        assert_eq!(
+            dp1.uniforms.get("u_pointer"),
+            Some(&UniformValue::Vec2([0.8, 0.2]))
+        );
+        assert_eq!(
+            dp1.textures.get("u_depth"),
+            Some(&TextureSpec {
+                path: PathBuf::from("/tmp/depth.png"),
+                filter: TextureFilter::Linear,
+                wrap: TextureWrap::ClampToEdge,
+                flip_y: false,
+            })
+        );
 
         let edp1 = cfg.base_spec_for("eDP-1");
         assert_eq!(edp1.fit, FitMode::Contain);
         assert_eq!(edp1.transition, "dissolve");
         assert_eq!(edp1.duration_ms, 600);
+        assert_eq!(
+            edp1.uniforms.get("u_pointer"),
+            Some(&UniformValue::Vec2([0.5, 0.5]))
+        );
     }
 
     #[test]
-    fn persisted_state_roundtrips_atomically() {
+    fn persisted_state_roundtrips_atomically_and_accepts_v1_minimal() {
         let dir = std::env::temp_dir().join(format!("glwall-cfg-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let state_path = dir.join("state.json");
 
         let mut state = PersistedState::default();
+        let mut textures = BTreeMap::new();
+        textures.insert(
+            "u_depth".to_string(),
+            TextureSpec {
+                path: PathBuf::from("/tmp/depth.png"),
+                filter: TextureFilter::Nearest,
+                wrap: TextureWrap::Repeat,
+                flip_y: true,
+            },
+        );
+        let mut uniforms = BTreeMap::new();
+        uniforms.insert("u_pointer".to_string(), UniformValue::Vec2([0.25, 0.75]));
+
         state.outputs.insert(
             "DP-1".to_string(),
             OutputSpec {
@@ -344,12 +416,34 @@ transition = "wipe"
                 params: [1.0, 2.0, 3.0, 4.0],
                 fps: Some(60.0),
                 hwaccel: HwAccel::Auto,
+                textures,
+                uniforms,
             },
         );
 
         state.save_atomic(&state_path).unwrap();
         let loaded = PersistedState::load_or_default(&state_path);
         assert_eq!(loaded, state);
+
+        // v0.1.x state.json without `textures`/`uniforms` fields still loads cleanly.
+        let legacy_json = r#"{
+            "version": 1,
+            "outputs": {
+                "eDP-1": {
+                    "target": "/tmp/bg.png",
+                    "fit": "cover",
+                    "shader": null,
+                    "transition": "fade",
+                    "duration_ms": 450,
+                    "params": [0.0, 0.0, 0.0, 0.0],
+                    "fps": null,
+                    "hwaccel": "auto"
+                }
+            }
+        }"#;
+        let legacy: PersistedState = serde_json::from_str(legacy_json).unwrap();
+        assert!(legacy.outputs["eDP-1"].textures.is_empty());
+        assert!(legacy.outputs["eDP-1"].uniforms.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::slice;
 
 use anyhow::{Result, bail};
@@ -7,11 +8,35 @@ use glow::HasContext;
 use crate::config::{ColorSpace, FitMode};
 use crate::gpu::shader::{
     AssembledShader, BUILTIN_PASSTHROUGH, ShaderMode, VERTEX_SHADER_SRC, assemble_fragment_shader,
+    is_builtin_sampler, is_builtin_uniform,
 };
+use crate::gpu::uniforms::{
+    ReflectedSampler, ReflectedUniform, ShaderSchema, TextureFilter, TextureSpec, TextureWrap,
+    UniformType, UniformValue, upload_uniform,
+};
+
+#[derive(Debug)]
+pub struct UserUniformSlot {
+    pub name: String,
+    pub utype: UniformType,
+    pub location: glow::UniformLocation,
+}
+
+#[derive(Debug)]
+pub struct UserSamplerSlot {
+    pub name: String,
+    pub location: glow::UniformLocation,
+    pub size_location: Option<glow::UniformLocation>,
+}
 
 pub struct GlProgram {
     pub handle: glow::Program,
     pub assembled: AssembledShader,
+    pub uses_time: bool,
+    pub uses_progress: bool,
+    pub uses_ichannel0: bool,
+    pub user_uniforms: Vec<UserUniformSlot>,
+    pub user_samplers: Vec<UserSamplerSlot>,
     locs: ProgramLocations,
 }
 
@@ -75,15 +100,168 @@ impl GlProgram {
         }
 
         let locs = unsafe { ProgramLocations::query(gl, program) };
+        let reflected = unsafe { reflect_program(gl, program) };
+        let uses_time = assembled.uses_time
+            && (reflected.active_builtins.contains("u_time")
+                || reflected.active_builtins.contains("u_delta")
+                || reflected.active_builtins.contains("u_frame"));
+        let uses_progress = reflected.active_builtins.contains("u_progress");
+        let uses_ichannel0 = assembled.uses_ichannel0
+            && (reflected.active_builtins.contains("iChannel0") || locs.i_channel0.is_some());
+
         Ok(Self {
             handle: program,
             assembled,
+            uses_time,
+            uses_progress,
+            uses_ichannel0,
+            user_uniforms: reflected.user_uniforms,
+            user_samplers: reflected.user_samplers,
             locs,
         })
     }
 
+    pub fn schema(&self) -> ShaderSchema {
+        let mode = match self.assembled.mode {
+            ShaderMode::Glwall => "glwall",
+            ShaderMode::Shadertoy => "shadertoy",
+        };
+        ShaderSchema {
+            mode: mode.to_string(),
+            uses_time: self.uses_time,
+            uses_progress: self.uses_progress,
+            uses_ichannel0: self.uses_ichannel0,
+            uniforms: self
+                .user_uniforms
+                .iter()
+                .map(|u| ReflectedUniform {
+                    name: u.name.clone(),
+                    utype: u.utype,
+                })
+                .collect(),
+            samplers: self
+                .user_samplers
+                .iter()
+                .map(|s| ReflectedSampler {
+                    name: s.name.clone(),
+                    has_size_uniform: s.size_location.is_some(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn validate_uniform(&self, name: &str, value: &UniformValue) -> Result<()> {
+        let Some(slot) = self.user_uniforms.iter().find(|u| u.name == name) else {
+            return Ok(());
+        };
+        let compatible = matches!(
+            (slot.utype, value),
+            (
+                UniformType::Float,
+                UniformValue::Float(_) | UniformValue::Int(_)
+            ) | (
+                UniformType::Int,
+                UniformValue::Int(_) | UniformValue::Bool(_)
+            ) | (
+                UniformType::Bool,
+                UniformValue::Bool(_) | UniformValue::Int(_)
+            ) | (UniformType::Vec2, UniformValue::Vec2(_))
+                | (UniformType::Vec3, UniformValue::Vec3(_))
+                | (UniformType::Vec4, UniformValue::Vec4(_))
+        );
+        if !compatible {
+            bail!(
+                "uniform '{name}' expects {}, got {}",
+                slot.utype,
+                value.value_type()
+            );
+        }
+        Ok(())
+    }
+
     pub fn destroy(self, gl: &glow::Context) {
         unsafe { gl.delete_program(self.handle) };
+    }
+}
+
+struct ReflectedBindings {
+    active_builtins: HashSet<String>,
+    user_uniforms: Vec<UserUniformSlot>,
+    user_samplers: Vec<UserSamplerSlot>,
+}
+
+unsafe fn reflect_program(gl: &glow::Context, program: glow::Program) -> ReflectedBindings {
+    let count = unsafe { gl.get_active_uniforms(program) };
+    let mut active_builtins = HashSet::new();
+    let mut raw_samplers: Vec<(String, glow::UniformLocation)> = Vec::new();
+    let mut raw_uniforms: Vec<(String, UniformType, glow::UniformLocation)> = Vec::new();
+
+    for idx in 0..count {
+        let Some(active) = (unsafe { gl.get_active_uniform(program, idx) }) else {
+            continue;
+        };
+        let clean_name = active
+            .name
+            .strip_suffix("[0]")
+            .unwrap_or(&active.name)
+            .to_string();
+        if is_builtin_sampler(&clean_name) || is_builtin_uniform(&clean_name) {
+            active_builtins.insert(clean_name);
+            continue;
+        }
+        if active.size > 1 {
+            continue;
+        }
+
+        let Some(location) = (unsafe { gl.get_uniform_location(program, &active.name) }) else {
+            continue;
+        };
+
+        if active.utype == glow::SAMPLER_2D {
+            raw_samplers.push((clean_name, location));
+        } else if let Some(utype) = UniformType::from_gl_type(active.utype) {
+            raw_uniforms.push((clean_name, utype, location));
+        }
+    }
+
+    let sampler_names: HashSet<String> = raw_samplers.iter().map(|(n, _)| n.clone()).collect();
+    let mut size_locations: HashMap<String, glow::UniformLocation> = HashMap::new();
+    let mut user_uniforms = Vec::new();
+
+    for (name, utype, location) in raw_uniforms {
+        if utype == UniformType::Vec2
+            && let Some(base) = name.strip_suffix("_size")
+            && sampler_names.contains(base)
+        {
+            size_locations.insert(base.to_string(), location);
+            continue;
+        }
+        user_uniforms.push(UserUniformSlot {
+            name,
+            utype,
+            location,
+        });
+    }
+
+    let mut user_samplers: Vec<UserSamplerSlot> = raw_samplers
+        .into_iter()
+        .map(|(name, location)| {
+            let size_location = size_locations.remove(&name);
+            UserSamplerSlot {
+                name,
+                location,
+                size_location,
+            }
+        })
+        .collect();
+
+    user_samplers.sort_by(|a, b| a.name.cmp(&b.name));
+    user_uniforms.sort_by(|a, b| a.name.cmp(&b.name));
+
+    ReflectedBindings {
+        active_builtins,
+        user_uniforms,
+        user_samplers,
     }
 }
 
@@ -153,35 +331,26 @@ impl OwnedTexture {
             gl.create_texture()
                 .map_err(|e| anyhow::anyhow!("glCreateTexture failed: {e}"))?
         };
-        unsafe {
-            gl.bind_texture(glow::TEXTURE_2D, Some(handle));
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MIN_FILTER,
-                glow::LINEAR as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MAG_FILTER,
-                glow::LINEAR as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_WRAP_S,
-                glow::CLAMP_TO_EDGE as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_WRAP_T,
-                glow::CLAMP_TO_EDGE as i32,
-            );
-            gl.bind_texture(glow::TEXTURE_2D, None);
-        }
-        Ok(Self {
+        let tex = Self {
             handle,
             width: 0,
             height: 0,
-        })
+        };
+        tex.set_sampler_params(gl, TextureFilter::Linear, TextureWrap::ClampToEdge);
+        Ok(tex)
+    }
+
+    fn set_sampler_params(&self, gl: &glow::Context, filter: TextureFilter, wrap: TextureWrap) {
+        let gl_filter = filter.to_gl() as i32;
+        let gl_wrap = wrap.to_gl() as i32;
+        unsafe {
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.handle));
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, gl_filter);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, gl_filter);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, gl_wrap);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, gl_wrap);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
     }
 
     fn upload_rgba(&mut self, gl: &glow::Context, width: u32, height: u32, data: &[u8]) {
@@ -251,6 +420,186 @@ impl OwnedTexture {
 
     fn destroy(self, gl: &glow::Context) {
         unsafe { gl.delete_texture(self.handle) };
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TextureId(pub u64);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TextureKey {
+    pub path: PathBuf,
+    pub filter: TextureFilter,
+    pub wrap: TextureWrap,
+    pub flip_y: bool,
+}
+
+impl TextureKey {
+    pub fn from_spec(spec: &TextureSpec) -> Self {
+        let canonical = std::fs::canonicalize(&spec.path).unwrap_or_else(|_| spec.path.clone());
+        Self {
+            path: canonical,
+            filter: spec.filter,
+            wrap: spec.wrap,
+            flip_y: spec.flip_y,
+        }
+    }
+}
+
+struct PoolEntry<T> {
+    key: TextureKey,
+    tex: T,
+    width: u32,
+    height: u32,
+    refs: usize,
+}
+
+pub struct TexturePoolCore<T> {
+    next_id: u64,
+    entries: HashMap<TextureId, PoolEntry<T>>,
+    by_key: HashMap<TextureKey, TextureId>,
+}
+
+impl<T> Default for TexturePoolCore<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> TexturePoolCore<T> {
+    pub fn new() -> Self {
+        Self {
+            next_id: 1,
+            entries: HashMap::new(),
+            by_key: HashMap::new(),
+        }
+    }
+
+    pub fn acquire(&mut self, key: &TextureKey) -> Option<TextureId> {
+        let id = *self.by_key.get(key)?;
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.refs += 1;
+            return Some(id);
+        }
+        None
+    }
+
+    pub fn insert_or_acquire(
+        &mut self,
+        key: TextureKey,
+        width: u32,
+        height: u32,
+        tex: T,
+    ) -> (TextureId, Option<T>) {
+        if let Some(id) = self.acquire(&key) {
+            return (id, Some(tex));
+        }
+        let id = TextureId(self.next_id);
+        self.next_id += 1;
+        self.by_key.insert(key.clone(), id);
+        self.entries.insert(
+            id,
+            PoolEntry {
+                key,
+                tex,
+                width,
+                height,
+                refs: 1,
+            },
+        );
+        (id, None)
+    }
+
+    pub fn release(&mut self, id: TextureId) -> Option<T> {
+        let entry = self.entries.get_mut(&id)?;
+        if entry.refs > 1 {
+            entry.refs -= 1;
+            return None;
+        }
+        let removed = self.entries.remove(&id)?;
+        self.by_key.remove(&removed.key);
+        Some(removed.tex)
+    }
+
+    pub fn get(&self, id: TextureId) -> Option<(u32, u32, &T)> {
+        self.entries.get(&id).map(|e| (e.width, e.height, &e.tex))
+    }
+
+    #[cfg(test)]
+    pub fn ref_count(&self, id: TextureId) -> usize {
+        self.entries.get(&id).map_or(0, |e| e.refs)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn drain_all(&mut self) -> Vec<T> {
+        self.by_key.clear();
+        self.entries.drain().map(|(_, e)| e.tex).collect()
+    }
+}
+
+pub struct TexturePool {
+    core: TexturePoolCore<OwnedTexture>,
+}
+
+impl TexturePool {
+    pub fn new() -> Self {
+        Self {
+            core: TexturePoolCore::new(),
+        }
+    }
+
+    pub fn acquire(&mut self, key: &TextureKey) -> Option<TextureId> {
+        self.core.acquire(key)
+    }
+
+    pub fn insert_rgba(
+        &mut self,
+        gl: &glow::Context,
+        key: TextureKey,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<TextureId> {
+        if let Some(id) = self.core.acquire(&key) {
+            return Ok(id);
+        }
+        let mut tex = OwnedTexture::new(gl)?;
+        tex.set_sampler_params(gl, key.filter, key.wrap);
+        tex.upload_rgba(gl, width, height, pixels);
+        let (id, leftover) = self.core.insert_or_acquire(key, width, height, tex);
+        if let Some(unused) = leftover {
+            unused.destroy(gl);
+        }
+        Ok(id)
+    }
+
+    pub fn release(&mut self, gl: &glow::Context, id: TextureId) {
+        if let Some(tex) = self.core.release(id) {
+            tex.destroy(gl);
+        }
+    }
+
+    pub fn texture_info(&self, id: TextureId) -> Option<(glow::Texture, u32, u32)> {
+        self.core.get(id).map(|(w, h, t)| (t.handle, w, h))
+    }
+
+    pub fn len(&self) -> usize {
+        self.core.len()
+    }
+
+    pub fn destroy(mut self, gl: &glow::Context) {
+        for tex in self.core.drain_all() {
+            tex.destroy(gl);
+        }
+    }
+}
+
+impl Default for TexturePool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -421,6 +770,18 @@ pub enum SlotMediaKind {
     Nv12 = 2,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SlotBinding {
+    kind: SlotMediaKind,
+    width: u32,
+    height: u32,
+    fit: FitMode,
+    colorspace: ColorSpace,
+    rgba_tex: Option<glow::Texture>,
+    y_tex: Option<glow::Texture>,
+    uv_tex: Option<glow::Texture>,
+}
+
 pub struct MediaSlotGpu {
     pub kind: SlotMediaKind,
     pub width: u32,
@@ -445,6 +806,19 @@ impl MediaSlotGpu {
             y_tex: None,
             uv_tex: None,
             pbo_ring: None,
+        }
+    }
+
+    fn as_binding(&self) -> SlotBinding {
+        SlotBinding {
+            kind: self.kind,
+            width: self.width,
+            height: self.height,
+            fit: self.fit,
+            colorspace: self.colorspace,
+            rgba_tex: self.rgba_tex.as_ref().map(|t| t.handle),
+            y_tex: self.y_tex.as_ref().map(|t| t.handle),
+            uv_tex: self.uv_tex.as_ref().map(|t| t.handle),
         }
     }
 
@@ -557,7 +931,13 @@ impl ResolveTarget {
                 Some(color_tex.handle),
                 0,
             );
+            let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                gl.delete_framebuffer(fbo);
+                color_tex.destroy(gl);
+                bail!("resolve framebuffer incomplete: 0x{status:x}");
+            }
         }
         Ok(Self { fbo, color_tex })
     }
@@ -590,6 +970,8 @@ pub struct DrawParams<'a> {
     pub custom_program: Option<&'a GlProgram>,
     pub transition_program: Option<&'a GlProgram>,
     pub in_transition: bool,
+    pub custom_textures: &'a BTreeMap<String, TextureId>,
+    pub custom_uniforms: &'a BTreeMap<String, UniformValue>,
 }
 
 pub struct Renderer {
@@ -598,6 +980,7 @@ pub struct Renderer {
     dummy_tex: OwnedTexture,
     passthrough_program: GlProgram,
     resolve_targets: HashMap<String, ResolveTarget>,
+    max_texture_units: u32,
 }
 
 type SlotUniformLocs<'a> = (
@@ -619,6 +1002,8 @@ impl Renderer {
         let mut dummy_tex = OwnedTexture::new(&gl)?;
         dummy_tex.upload_rgba(&gl, 1, 1, &[0, 0, 0, 255]);
         let passthrough_program = GlProgram::compile(&gl, BUILTIN_PASSTHROUGH)?;
+        let max_texture_units =
+            unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_IMAGE_UNITS) }.max(8) as u32;
 
         Ok(Self {
             gl,
@@ -626,6 +1011,7 @@ impl Renderer {
             dummy_tex,
             passthrough_program,
             resolve_targets: HashMap::new(),
+            max_texture_units,
         })
     }
 
@@ -635,50 +1021,105 @@ impl Renderer {
         }
     }
 
-    pub fn draw(&mut self, params: &DrawParams<'_>) -> Result<()> {
-        let program = if params.in_transition {
-            params
-                .transition_program
-                .unwrap_or(&self.passthrough_program)
+    fn ensure_resolve_target(
+        &mut self,
+        output_name: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<(glow::Framebuffer, glow::Texture)> {
+        let w = width.max(1);
+        let h = height.max(1);
+        let target = match self.resolve_targets.get_mut(output_name) {
+            Some(t) => {
+                t.ensure_size(&self.gl, w, h);
+                t
+            }
+            None => {
+                let created = ResolveTarget::new(&self.gl, w, h)?;
+                self.resolve_targets
+                    .entry(output_name.to_string())
+                    .or_insert(created)
+            }
+        };
+        Ok((target.fbo, target.color_tex.handle))
+    }
+
+    pub fn draw(&mut self, params: &DrawParams<'_>, texture_pool: &TexturePool) -> Result<()> {
+        let w = params.width.max(1);
+        let h = params.height.max(1);
+        let raw_slot0 = params.slot0.as_binding();
+        let raw_slot1 = params.slot1.map(MediaSlotGpu::as_binding);
+
+        if params.in_transition
+            && let Some(custom) = params.custom_program
+            && let Some(transition) = params.transition_program
+        {
+            // Render the transition into an offscreen FBO first, then feed it as
+            // slot0 (and iChannel0 for Shadertoy) into the active custom shader.
+            let (fbo, color_tex) = self.ensure_resolve_target(params.output_name, w, h)?;
+            unsafe {
+                self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                self.gl.viewport(0, 0, w as i32, h as i32);
+                self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                self.gl.clear(glow::COLOR_BUFFER_BIT);
+                self.gl.use_program(Some(transition.handle));
+                self.bind_common_uniforms(transition, params, raw_slot0, raw_slot1, None);
+                self.bind_user_bindings(transition, params, texture_pool);
+                self.gl.bind_vertex_array(Some(self.vao));
+                self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            }
+
+            let resolved_slot0 = SlotBinding {
+                kind: SlotMediaKind::Rgba,
+                width: w,
+                height: h,
+                fit: params.slot0.fit,
+                colorspace: params.slot0.colorspace,
+                rgba_tex: Some(color_tex),
+                y_tex: None,
+                uv_tex: None,
+            };
+            let ichannel0_tex = (custom.assembled.mode == ShaderMode::Shadertoy
+                && custom.uses_ichannel0)
+                .then_some(color_tex);
+
+            unsafe {
+                self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                self.gl.viewport(0, 0, w as i32, h as i32);
+                self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                self.gl.clear(glow::COLOR_BUFFER_BIT);
+                self.gl.use_program(Some(custom.handle));
+                self.bind_common_uniforms(custom, params, resolved_slot0, None, ichannel0_tex);
+                self.bind_user_bindings(custom, params, texture_pool);
+                self.gl.bind_vertex_array(Some(self.vao));
+                self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                self.gl.bind_vertex_array(None);
+                self.gl.use_program(None);
+            }
+            return Ok(());
+        }
+
+        let explicit_program = if params.in_transition {
+            params.transition_program
         } else {
-            params.custom_program.unwrap_or(&self.passthrough_program)
+            params.custom_program
+        };
+        let need_ichannel0 = {
+            let p = explicit_program.unwrap_or(&self.passthrough_program);
+            p.assembled.mode == ShaderMode::Shadertoy
+                && p.uses_ichannel0
+                && params.slot0.kind != SlotMediaKind::None
         };
 
         let mut ichannel0_tex: Option<glow::Texture> = None;
-        if program.assembled.mode == ShaderMode::Shadertoy
-            && program.assembled.uses_ichannel0
-            && params.slot0.kind != SlotMediaKind::None
-        {
-            let (fbo, color_tex) = {
-                let target = match self.resolve_targets.get_mut(params.output_name) {
-                    Some(t) => {
-                        t.ensure_size(&self.gl, params.width.max(1), params.height.max(1));
-                        t
-                    }
-                    None => {
-                        let created = ResolveTarget::new(
-                            &self.gl,
-                            params.width.max(1),
-                            params.height.max(1),
-                        )?;
-                        self.resolve_targets
-                            .entry(params.output_name.to_string())
-                            .or_insert(created)
-                    }
-                };
-                (target.fbo, target.color_tex.handle)
-            };
-
+        if need_ichannel0 {
+            let (fbo, color_tex) = self.ensure_resolve_target(params.output_name, w, h)?;
             unsafe {
                 self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-                self.gl.viewport(
-                    0,
-                    0,
-                    params.width.max(1) as i32,
-                    params.height.max(1) as i32,
-                );
+                self.gl.viewport(0, 0, w as i32, h as i32);
                 self.gl.use_program(Some(self.passthrough_program.handle));
-                self.bind_common_uniforms(&self.passthrough_program, params, None);
+                self.bind_common_uniforms(&self.passthrough_program, params, raw_slot0, None, None);
                 self.gl.bind_vertex_array(Some(self.vao));
                 self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
                 self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -686,18 +1127,16 @@ impl Renderer {
             ichannel0_tex = Some(color_tex);
         }
 
+        let program = explicit_program.unwrap_or(&self.passthrough_program);
+
         unsafe {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            self.gl.viewport(
-                0,
-                0,
-                params.width.max(1) as i32,
-                params.height.max(1) as i32,
-            );
+            self.gl.viewport(0, 0, w as i32, h as i32);
             self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
             self.gl.clear(glow::COLOR_BUFFER_BIT);
             self.gl.use_program(Some(program.handle));
-            self.bind_common_uniforms(program, params, ichannel0_tex);
+            self.bind_common_uniforms(program, params, raw_slot0, raw_slot1, ichannel0_tex);
+            self.bind_user_bindings(program, params, texture_pool);
             self.gl.bind_vertex_array(Some(self.vao));
             self.gl.draw_arrays(glow::TRIANGLES, 0, 3);
             self.gl.bind_vertex_array(None);
@@ -710,6 +1149,8 @@ impl Renderer {
         &self,
         program: &GlProgram,
         params: &DrawParams<'_>,
+        slot0: SlotBinding,
+        slot1: Option<SlotBinding>,
         ichannel0: Option<glow::Texture>,
     ) {
         let gl = &self.gl;
@@ -735,7 +1176,7 @@ impl Renderer {
 
             // Slot 0 -> texture units 0, 1, 2
             self.bind_slot(
-                params.slot0,
+                slot0,
                 [0, 1, 2],
                 (
                     locs.u_tex0_rgba.as_ref(),
@@ -749,9 +1190,9 @@ impl Renderer {
             );
 
             // Slot 1 -> texture units 3, 4, 5
-            if let Some(slot1) = params.slot1 {
+            if let Some(s1) = slot1 {
                 self.bind_slot(
-                    slot1,
+                    s1,
                     [3, 4, 5],
                     (
                         locs.u_tex1_rgba.as_ref(),
@@ -777,29 +1218,53 @@ impl Renderer {
         }
     }
 
-    unsafe fn bind_slot(&self, slot: &MediaSlotGpu, units: [u32; 3], locs: SlotUniformLocs<'_>) {
+    unsafe fn bind_user_bindings(
+        &self,
+        program: &GlProgram,
+        params: &DrawParams<'_>,
+        texture_pool: &TexturePool,
+    ) {
+        let gl = &self.gl;
+        for (next_unit, sampler) in (7_u32..).zip(program.user_samplers.iter()) {
+            if next_unit >= self.max_texture_units {
+                break;
+            }
+            let (tex_handle, tex_w, tex_h) = params
+                .custom_textures
+                .get(&sampler.name)
+                .and_then(|id| texture_pool.texture_info(*id))
+                .unwrap_or((self.dummy_tex.handle, 1, 1));
+            unsafe {
+                gl.active_texture(glow::TEXTURE0 + next_unit);
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex_handle));
+                gl.uniform_1_i32(Some(&sampler.location), next_unit as i32);
+                if let Some(ref size_loc) = sampler.size_location {
+                    gl.uniform_2_f32(Some(size_loc), tex_w.max(1) as f32, tex_h.max(1) as f32);
+                }
+            }
+        }
+
+        for uniform in &program.user_uniforms {
+            if let Some(value) = params.custom_uniforms.get(&uniform.name) {
+                let _ = upload_uniform(gl, &uniform.location, uniform.utype, value);
+            }
+        }
+    }
+
+    unsafe fn bind_slot(&self, slot: SlotBinding, units: [u32; 3], locs: SlotUniformLocs<'_>) {
         let gl = &self.gl;
         let dummy = self.dummy_tex.handle;
         unsafe {
             gl.active_texture(glow::TEXTURE0 + units[0]);
-            gl.bind_texture(
-                glow::TEXTURE_2D,
-                Some(slot.rgba_tex.as_ref().map_or(dummy, |t| t.handle)),
-            );
+            gl.bind_texture(glow::TEXTURE_2D, Some(slot.rgba_tex.unwrap_or(dummy)));
             gl.uniform_1_i32(locs.0, units[0] as i32);
 
             gl.active_texture(glow::TEXTURE0 + units[1]);
-            gl.bind_texture(
-                glow::TEXTURE_2D,
-                Some(slot.y_tex.as_ref().map_or(dummy, |t| t.handle)),
-            );
+            gl.bind_texture(glow::TEXTURE_2D, Some(slot.y_tex.unwrap_or(dummy)));
             gl.uniform_1_i32(locs.1, units[1] as i32);
 
             gl.active_texture(glow::TEXTURE0 + units[2]);
-            gl.bind_texture(
-                glow::TEXTURE_2D,
-                Some(slot.uv_tex.as_ref().map_or(dummy, |t| t.handle)),
-            );
+            gl.bind_texture(glow::TEXTURE_2D, Some(slot.uv_tex.unwrap_or(dummy)));
             gl.uniform_1_i32(locs.2, units[2] as i32);
 
             gl.uniform_1_i32(locs.3, slot.kind as i32);
@@ -818,5 +1283,50 @@ impl Renderer {
         unsafe {
             self.gl.delete_vertex_array(self.vao);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_key(name: &str, filter: TextureFilter) -> TextureKey {
+        TextureKey {
+            path: PathBuf::from(name),
+            filter,
+            wrap: TextureWrap::ClampToEdge,
+            flip_y: false,
+        }
+    }
+
+    #[test]
+    fn texture_pool_refcounts_and_eviction() {
+        let mut pool: TexturePoolCore<&'static str> = TexturePoolCore::new();
+        let k1 = test_key("/tmp/depth_a.png", TextureFilter::Linear);
+        let k2 = test_key("/tmp/depth_a.png", TextureFilter::Nearest);
+
+        assert!(pool.acquire(&k1).is_none());
+        let (id1, extra) = pool.insert_or_acquire(k1.clone(), 512, 288, "tex_linear");
+        assert!(extra.is_none());
+        assert_eq!(pool.ref_count(id1), 1);
+
+        // Second acquire of the exact same key shares ID and bumps refcount.
+        assert_eq!(pool.acquire(&k1), Some(id1));
+        assert_eq!(pool.ref_count(id1), 2);
+
+        // Different filter creates a separate pool entry so outputs don't stomp sampler state.
+        let (id2, extra2) = pool.insert_or_acquire(k2.clone(), 512, 288, "tex_nearest");
+        assert!(extra2.is_none());
+        assert_ne!(id1, id2);
+        assert_eq!(pool.len(), 2);
+
+        // First release decrements without evicting.
+        assert!(pool.release(id1).is_none());
+        assert_eq!(pool.ref_count(id1), 1);
+
+        // Final release evicts and returns underlying handle for destruction.
+        assert_eq!(pool.release(id1), Some("tex_linear"));
+        assert!(pool.acquire(&k1).is_none());
+        assert_eq!(pool.len(), 1);
     }
 }

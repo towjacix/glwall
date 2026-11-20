@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use calloop::channel::Sender;
 
 use crate::config::{ColorSpace, HwAccel};
+use crate::gpu::renderer::TextureKey;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
@@ -166,6 +167,39 @@ pub enum MediaEvent {
         generation: u64,
         message: String,
     },
+    AuxTextureReady {
+        key: TextureKey,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    },
+    AuxTextureError {
+        key: TextureKey,
+        message: String,
+    },
+}
+
+pub fn decode_texture_async(key: TextureKey, sender: Sender<MediaEvent>) {
+    let _ = std::thread::Builder::new()
+        .name("glwall-tex".to_string())
+        .spawn(
+            move || match static_img::decode_rgba_image(&key.path, key.flip_y) {
+                Ok((width, height, pixels)) => {
+                    let _ = sender.send(MediaEvent::AuxTextureReady {
+                        key,
+                        width,
+                        height,
+                        pixels,
+                    });
+                }
+                Err(err) => {
+                    let _ = sender.send(MediaEvent::AuxTextureError {
+                        key,
+                        message: format!("{err}"),
+                    });
+                }
+            },
+        );
 }
 
 #[derive(Debug)]
