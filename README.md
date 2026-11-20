@@ -2,6 +2,20 @@
 
 Standalone Wayland OpenGL ES 3.0 / EGL wallpaper daemon and CLI controller with first-class custom `.frag` shader support, zero-draw idle for static images, streaming animated GIF/WebP, FFmpeg NV12 video playback, HiDPI fractional scaling, and fullscreen auto-pause.
 
+## Install
+
+Via [mise](https://mise.jdx.dev/) (no Rust toolchain required on the target machine):
+
+```bash
+mise use -g github:towjacix/glwall
+```
+
+Or via [cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
+
+```bash
+cargo binstall --git https://github.com/towjacix/glwall glwall
+```
+
 ## Features
 
 - **Custom GLSL Shaders (`.frag`)**: Hot-reload via `inotify` (keeps old shader on compile errors), unified `sampleWallpaper(uv)` / `samplePrevWallpaper(uv)` preamble across images, animations, and NV12 videos, plus automatic **Shadertoy (`mainImage`)** compatibility.

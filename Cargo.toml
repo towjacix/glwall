@@ -1,10 +1,15 @@
 [package]
 name = "glwall"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Standalone Wayland OpenGL ES 3.0 / EGL live and custom-shader wallpaper daemon"
 license = "MIT"
 repository = "https://github.com/towjacix/glwall"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "bin/{ bin }{ binary-ext }"
 
 [dependencies]
 anyhow = "1"

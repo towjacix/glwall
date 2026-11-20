@@ -33,8 +33,7 @@ jobs:
             libgles2 \
             libgl1-mesa-dri \
             pkg-config \
-            zstd \
-            ffmpeg
+            zstd
 
       - uses: Swatinem/rust-cache@v2
 
@@ -57,11 +56,13 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: ./target/release/glwall check-shader shaders/*.frag
 
-      - name: Package release archive and SHA256SUMS
+      - name: Package release archives and SHA256SUMS
         run: |
           TAG="${GITHUB_REF_NAME:-dev}"
+          TARGET="x86_64-unknown-linux-gnu"
           STAGE="dist/stage"
-          ARCHIVE="glwall-${TAG}-x86_64-linux.tar.zst"
+          ARCHIVE_GZ="glwall-${TAG}-${TARGET}.tar.gz"
+          ARCHIVE_ZST="glwall-${TAG}-${TARGET}.tar.zst"
           mkdir -p "${STAGE}/bin" "${STAGE}/share/glwall/shaders" "${STAGE}/share/systemd/user"
           cp target/release/glwall "${STAGE}/bin/glwall"
           chmod 0755 "${STAGE}/bin/glwall"
@@ -69,8 +70,9 @@ jobs:
           cp contrib/glwall.service "${STAGE}/share/systemd/user/glwall.service"
           cp README.md LICENSE "${STAGE}/"
           mkdir -p dist/out
-          tar -C "${STAGE}" --zstd -cf "dist/out/${ARCHIVE}" .
-          (cd dist/out && sha256sum "${ARCHIVE}" > SHA256SUMS)
+          tar -C "${STAGE}" -czf "dist/out/${ARCHIVE_GZ}" .
+          tar -C "${STAGE}" --zstd -cf "dist/out/${ARCHIVE_ZST}" .
+          (cd dist/out && sha256sum "${ARCHIVE_GZ}" "${ARCHIVE_ZST}" > SHA256SUMS)
           ls -lh dist/out
 
       - name: Publish GitHub Release
@@ -78,6 +80,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            dist/out/*.tar.gz
             dist/out/*.tar.zst
             dist/out/SHA256SUMS
           generate_release_notes: true

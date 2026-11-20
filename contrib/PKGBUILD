@@ -1,6 +1,6 @@
 # Maintainer: towjacix <manhp7658@gmail.com>
 pkgname=glwall-bin
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Standalone Wayland OpenGL ES 3.0 / EGL live & custom-shader wallpaper daemon"
 arch=('x86_64')
@@ -12,7 +12,7 @@ optdepends=(
 )
 provides=('glwall')
 conflicts=('glwall')
-source=("glwall-v${pkgver}-x86_64-linux.tar.zst::${url}/releases/download/v${pkgver}/glwall-v${pkgver}-x86_64-linux.tar.zst")
+source=("glwall-v${pkgver}-x86_64-unknown-linux-gnu.tar.zst::${url}/releases/download/v${pkgver}/glwall-v${pkgver}-x86_64-unknown-linux-gnu.tar.zst")
 sha256sums=('SKIP')
 
 package() {

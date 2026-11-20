@@ -28,8 +28,7 @@ jobs:
             libegl-mesa0 \
             libgles2 \
             libgl1-mesa-dri \
-            pkg-config \
-            ffmpeg
+            pkg-config
 
       - uses: Swatinem/rust-cache@v2
 
