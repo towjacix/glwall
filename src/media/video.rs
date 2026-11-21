@@ -277,7 +277,7 @@ pub fn parse_ffprobe_json(json_bytes: &[u8]) -> Result<MediaProbe> {
         }
     }
     if let Some(rotation) = stream.tags.rotate.as_deref()
-        && rotation.parse::<f64>().map_or(true, |angle| angle != 0.0)
+        && rotation.parse::<f64>() != Ok(0.0)
         && !found_matrix
     {
         bail!("rotation tag without a display matrix is not supported");

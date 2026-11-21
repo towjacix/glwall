@@ -815,7 +815,7 @@ thread_local! {
     // This renderer is confined to its EGL thread. ManuallyDrop keeps failed
     // driver registrations and their libraries alive even at thread shutdown.
     static RETIRED_CUDA: std::cell::RefCell<std::mem::ManuallyDrop<Vec<crate::gpu::cuda::CudaTextures>>> =
-        std::cell::RefCell::new(std::mem::ManuallyDrop::new(Vec::new()));
+        const { std::cell::RefCell::new(std::mem::ManuallyDrop::new(Vec::new())) };
 }
 
 pub(crate) fn retry_retired_cuda(gl: &glow::Context) {
