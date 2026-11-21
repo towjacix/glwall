@@ -800,7 +800,7 @@ mod tests {
             ("-65536 0 0 0 -65536 0 0 0 1073741824", (1920, 1080), true),
             ("0 -65536 0 65536 0 0 0 0 1073741824", (1080, 1920), true),
             ("0 65536 0 -65536 0 0 0 0 1073741824", (1080, 1920), true),
-            ("-65536 0 0 0 65536 0 0 0 0 1073741824", (1920, 1080), true),
+            ("-65536 0 0 0 65536 0 0 0 1073741824", (1920, 1080), true),
             ("0 65536 0 65536 0 0 0 0 1073741824", (1080, 1920), true),
         ] {
             let values: Vec<i32> = matrix
@@ -1023,11 +1023,10 @@ mod tests {
             command.args(["-y", "-v", "error"]);
             if rotation == "mirror" {
                 command.arg("-display_hflip");
+            } else {
+                command.args(["-display_rotation", rotation]);
             }
             command.arg("-i").arg(&source);
-            if rotation != "mirror" {
-                command.args(["-metadata:s:v:0", &format!("rotate={rotation}")]);
-            }
             let output = command
                 .args(["-c", "copy"])
                 .arg(&output_path)
