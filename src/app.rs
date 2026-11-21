@@ -1254,6 +1254,17 @@ impl AppCore {
                     return;
                 };
 
+                let is_cuda = matches!(&payload, FramePayload::Cuda(_));
+                if is_cuda
+                    && self.outputs[idx]
+                        .job
+                        .as_ref()
+                        .is_some_and(|j| j.control.cuda_failed())
+                {
+                    mailbox.recycle(payload);
+                    return;
+                }
+
                 if !matches!(self.ensure_renderer_on_surface(idx), Ok(true)) {
                     mailbox.recycle(payload);
                     return;
@@ -1279,11 +1290,22 @@ impl AppCore {
                         } => {
                             slot0.set_nv12(gl, *width, *height, fit, *colorspace, y_plane, uv_plane)
                         }
+                        FramePayload::Cuda(frame) => slot0.set_cuda(gl, frame, fit),
                     }
                 };
                 mailbox.recycle(payload);
 
                 if let Err(err) = upload_res {
+                    if is_cuda {
+                        tracing::warn!(
+                            "CUDA texture upload failed on {}: {err:#}; switching to FFmpeg",
+                            self.outputs[idx].name
+                        );
+                        if let Some(job) = &self.outputs[idx].job {
+                            job.control.request_cuda_fallback();
+                        }
+                        return;
+                    }
                     tracing::error!("texture upload failed on {}: {err}", self.outputs[idx].name);
                     return;
                 }

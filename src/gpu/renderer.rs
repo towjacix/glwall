@@ -803,6 +803,9 @@ pub struct MediaSlotGpu {
     y_tex: Option<OwnedTexture>,
     uv_tex: Option<OwnedTexture>,
     pbo_ring: Option<Nv12PboRing>,
+    cuda_textures: Option<crate::gpu::cuda::CudaTextures>,
+    cuda_staging: Option<crate::gpu::cuda::CudaTextures>,
+    cuda_binding: Option<(glow::Texture, glow::Texture)>,
 }
 
 impl MediaSlotGpu {
@@ -817,6 +820,9 @@ impl MediaSlotGpu {
             y_tex: None,
             uv_tex: None,
             pbo_ring: None,
+            cuda_textures: None,
+            cuda_staging: None,
+            cuda_binding: None,
         }
     }
 
@@ -829,8 +835,14 @@ impl MediaSlotGpu {
             colorspace: self.colorspace,
             framebuffer: false,
             rgba_tex: self.rgba_tex.as_ref().map(|t| t.handle),
-            y_tex: self.y_tex.as_ref().map(|t| t.handle),
-            uv_tex: self.uv_tex.as_ref().map(|t| t.handle),
+            y_tex: self
+                .cuda_binding
+                .map(|t| t.0)
+                .or_else(|| self.y_tex.as_ref().map(|t| t.handle)),
+            uv_tex: self
+                .cuda_binding
+                .map(|t| t.1)
+                .or_else(|| self.uv_tex.as_ref().map(|t| t.handle)),
         }
     }
 
@@ -867,6 +879,7 @@ impl MediaSlotGpu {
         y_plane: &[u8],
         uv_plane: &[u8],
     ) -> Result<()> {
+        self.clear_cuda(gl);
         self.clear_rgba(gl);
         if self.y_tex.is_none() {
             self.y_tex = Some(OwnedTexture::new(gl)?);
@@ -890,6 +903,29 @@ impl MediaSlotGpu {
         Ok(())
     }
 
+    pub fn set_cuda(
+        &mut self,
+        gl: &glow::Context,
+        frame: &crate::media::gst_cuda::CudaFrame,
+        fit: FitMode,
+    ) -> Result<()> {
+        if self.cuda_staging.is_none() {
+            self.cuda_staging = Some(crate::gpu::cuda::CudaTextures::new()?);
+        }
+        let binding =
+            frame.with_mapped(|mapped| self.cuda_staging.as_mut().unwrap().upload(gl, mapped))?;
+        std::mem::swap(&mut self.cuda_textures, &mut self.cuda_staging);
+        self.clear_rgba(gl);
+        self.clear_cpu_nv12(gl);
+        self.cuda_binding = Some(binding);
+        self.kind = SlotMediaKind::Nv12;
+        self.width = frame.width;
+        self.height = frame.height;
+        self.fit = fit;
+        self.colorspace = frame.colorspace;
+        Ok(())
+    }
+
     pub fn clear(&mut self, gl: &glow::Context) {
         self.clear_rgba(gl);
         self.clear_nv12(gl);
@@ -905,6 +941,25 @@ impl MediaSlotGpu {
     }
 
     fn clear_nv12(&mut self, gl: &glow::Context) {
+        self.clear_cuda(gl);
+        self.clear_cpu_nv12(gl);
+    }
+
+    fn clear_cuda(&mut self, gl: &glow::Context) {
+        self.cuda_binding = None;
+        if let Some(textures) = self.cuda_textures.take()
+            && let Err(err) = textures.destroy(gl)
+        {
+            tracing::error!("CUDA texture cleanup failed: {err:#}");
+        }
+        if let Some(textures) = self.cuda_staging.take()
+            && let Err(err) = textures.destroy(gl)
+        {
+            tracing::error!("CUDA staging texture cleanup failed: {err:#}");
+        }
+    }
+
+    fn clear_cpu_nv12(&mut self, gl: &glow::Context) {
         if let Some(tex) = self.y_tex.take() {
             tex.destroy(gl);
         }
@@ -1303,6 +1358,105 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an NVIDIA CUDA/GLES device, GStreamer nvcodec and ffmpeg"]
+    fn cuda_video_preserves_orientation_and_loops() {
+        use crate::media::gst_cuda::CudaDecoder;
+        use std::time::{Duration, Instant};
+
+        let path = std::env::temp_dir().join(format!("glwall-cuda-{}.mp4", std::process::id()));
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=128x128:r=10:d=0.4",
+                "-vf",
+                "drawbox=x=0:y=64:w=128:h=64:color=blue:t=fill",
+                "-threads",
+                "1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to create video fixture");
+
+        let egl = crate::gpu::egl::EglState::new_test_pbuffer(8, 8).unwrap();
+        let gl = egl.create_glow_context().unwrap();
+        let mut renderer = Renderer::new(gl).unwrap();
+        let mut slot = MediaSlotGpu::empty();
+        let mut decoder = CudaDecoder::open(&path, ColorSpace::Bt601Tv).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut frames = 0;
+        while frames < 7 && Instant::now() < deadline {
+            if let Some(frame) = decoder.pull(Duration::from_millis(100)).unwrap() {
+                slot.set_cuda(&renderer.gl, &frame, FitMode::Stretch)
+                    .unwrap();
+                frames += 1;
+            }
+        }
+        assert_eq!(
+            frames, 7,
+            "CUDA decoder failed to produce frames across a loop"
+        );
+        let pool = TexturePool::new();
+        let textures = BTreeMap::new();
+        let uniforms = BTreeMap::new();
+        let params = DrawParams {
+            width: 8,
+            height: 8,
+            time_secs: 0.0,
+            delta_secs: 0.0,
+            progress: 1.0,
+            frame_index: 0,
+            params: [0.0; 4],
+            output_index: 0,
+            output_name: "cuda-test",
+            slot0: &slot,
+            slot1: None,
+            custom_program: None,
+            transition_program: None,
+            in_transition: false,
+            custom_textures: &textures,
+            custom_uniforms: &uniforms,
+        };
+        renderer.draw(&params, &pool).unwrap();
+        let mut pixels = [0u8; 8 * 8 * 4];
+        unsafe {
+            renderer.gl.read_pixels(
+                0,
+                0,
+                8,
+                8,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+        }
+        let pixel = |x: usize, y: usize| &pixels[(y * 8 + x) * 4..(y * 8 + x) * 4 + 4];
+        let top = pixel(4, 6);
+        let bottom = pixel(4, 1);
+        assert!(top[0] > 150 && top[2] < 100, "expected red top: {top:?}");
+        assert!(
+            bottom[2] > 150 && bottom[0] < 100,
+            "expected blue bottom: {bottom:?}"
+        );
+        drop(decoder);
+        slot.destroy(&renderer.gl);
+        pool.destroy(&renderer.gl);
+        renderer.destroy();
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn wallpaper_keeps_orientation_through_transition_with_postprocessing() {

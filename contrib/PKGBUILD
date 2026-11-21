@@ -9,6 +9,9 @@ license=('MIT')
 depends=('glibc' 'libglvnd' 'wayland')
 optdepends=(
   'ffmpeg: hardware/software decoding for video wallpapers and AVIF/HEIF/JXL images'
+  'gst-plugins-bad-libs: optional NVIDIA CUDA video decoding without host frame copies'
+  'gst-plugins-base-libs: GStreamer playback and appsink for NVIDIA decoding'
+  'gst-plugins-good: MP4, WebM and Matroska demuxers for NVIDIA decoding'
 )
 provides=('glwall')
 conflicts=('glwall')

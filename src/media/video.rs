@@ -160,6 +160,19 @@ pub fn run_video(
     };
     let frame_interval = Duration::from_secs_f64(1.0 / effective_fps);
 
+    if matches!(requested_hwaccel, HwAccel::Auto | HwAccel::Cuda) {
+        match stream_cuda_session(path, probe, frame_interval, control, mailbox) {
+            Ok(()) => return,
+            Err(err) if !control.should_stop() => {
+                tracing::warn!(
+                    "CUDA video interop unavailable for {} ({err:#}); falling back to FFmpeg",
+                    path.display()
+                );
+            }
+            Err(_) => return,
+        }
+    }
+
     let mut hw = requested_hwaccel;
     loop {
         if control.should_stop() {
@@ -213,6 +226,58 @@ pub fn run_video(
             }
         }
     }
+}
+
+fn stream_cuda_session(
+    path: &Path,
+    probe: MediaProbe,
+    frame_interval: Duration,
+    control: &WorkerControl,
+    mailbox: &FrameMailbox,
+) -> Result<()> {
+    // The GPU bridge currently supports exactly two even-sized NV12 planes.
+    if probe.width < 2 || probe.height < 2 || probe.width % 2 != 0 || probe.height % 2 != 0 {
+        bail!("CUDA interop does not support odd video dimensions");
+    }
+    let mut decoder = super::gst_cuda::CudaDecoder::open(path, probe.colorspace)?;
+    let mut last_frame = Instant::now();
+    let mut next_deadline = Instant::now();
+    let mut count = 0u64;
+    while !control.should_stop() {
+        if control.is_paused() {
+            if !control.wait_if_paused() {
+                break;
+            }
+            last_frame = Instant::now();
+        }
+        if control.cuda_failed() {
+            bail!("CUDA texture upload failed");
+        }
+        let Some(frame) = decoder.pull(Duration::from_millis(100))? else {
+            if last_frame.elapsed() > Duration::from_secs(8) {
+                bail!("CUDA decoder did not produce a frame");
+            }
+            continue;
+        };
+        if frame.width != probe.width || frame.height != probe.height {
+            bail!("CUDA decoder changed video dimensions");
+        }
+        mailbox.publish(FramePayload::Cuda(frame));
+        count += 1;
+        last_frame = Instant::now();
+        let now = last_frame;
+        if count == 1 || now.saturating_duration_since(next_deadline) > frame_interval * 3 {
+            next_deadline = now + frame_interval;
+        } else {
+            next_deadline += frame_interval;
+        }
+        if let Some(wait) = next_deadline.checked_duration_since(now)
+            && !control.interruptible_sleep(wait)
+        {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

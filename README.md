@@ -25,7 +25,7 @@ cargo binstall --git https://github.com/towjacix/glwall glwall
 - **Multiple Input Types**:
   - Static images: `.jpg`, `.jpeg`, `.png`, `.webp`, `.bmp` (via `image`) and `.avif`, `.heif`, `.heic`, `.jxl` (via `ffmpeg`)
   - Animated images: `.gif`, animated `.webp` (streaming frame-by-frame)
-  - Video: `.mp4`, `.webm`, `.mkv`, `.mov`, `.m4v`, `.avi` via `ffmpeg` NV12 pipe -> PBO double-buffered `GL_R8`/`GL_RG8` GPU YUV->RGB conversion (`SIGSTOP`/`SIGCONT` pause)
+  - Video: `.mp4`, `.webm`, `.mkv`, `.mov`, `.m4v`, `.avi`; NVIDIA systems can use optional GStreamer CUDA decoding with GPU-local NV12 texture copies. If unavailable or incompatible, FFmpeg streams NV12 through PBO-backed textures.
   - Procedural shaders: `.frag` / `.glsl` directly without any media file
 - **Wayland Layer-Shell**: `zwlr_layer_shell_v1` (`Layer::Background`, `namespace = "glwall:bg"`), `wp_fractional_scale_v1` + `wp_viewporter`, multi-output hot-plug, shared `EGLContext`, single-callback `wl_surface.frame` pacing.
 - **Fullscreen Auto-Pause**: Native `zwlr_foreign_toplevel_management_v1` per-output fullscreen pause tracking with independent pause reasons (`manual`, `fullscreen`, custom IPC tags).

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, gpu-video-interop]
   pull_request:
 
 env:
@@ -45,3 +45,18 @@ jobs:
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: cargo run --locked -- check-shader shaders/*.frag
+
+      - name: Build hardware-test artifacts
+        if: github.ref == 'refs/heads/gpu-video-interop'
+        run: |
+          cargo build --release --locked
+          cargo test --locked --no-run --message-format=json | jq -r 'select(.profile.test == true and .executable != null) | .executable' > target/test-executables.txt
+          cp "$(head -n 1 target/test-executables.txt)" target/glwall-tests
+
+      - uses: actions/upload-artifact@v4
+        if: github.ref == 'refs/heads/gpu-video-interop'
+        with:
+          name: gpu-video-interop
+          path: |
+            target/release/glwall
+            target/glwall-tests

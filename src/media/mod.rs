@@ -1,3 +1,4 @@
+pub mod gst_cuda;
 pub mod static_img;
 pub mod video;
 
@@ -64,6 +65,7 @@ pub enum FramePayload {
         y_plane: Vec<u8>,
         uv_plane: Vec<u8>,
     },
+    Cuda(gst_cuda::CudaFrame),
 }
 
 #[derive(Debug, Default)]
@@ -153,6 +155,7 @@ fn recycle_into(guard: &mut MailboxInner, payload: FramePayload) {
             guard.spare_y = y_plane;
             guard.spare_uv = uv_plane;
         }
+        FramePayload::Cuda(_) => {}
     }
 }
 
@@ -228,6 +231,7 @@ pub fn decode_texture_async(key: TextureKey, sender: Sender<MediaEvent>) {
 pub struct WorkerControl {
     stop: AtomicBool,
     paused: AtomicBool,
+    cuda_failed: AtomicBool,
     cv_lock: Mutex<()>,
     cv: Condvar,
     child_pid: AtomicI32,
@@ -238,6 +242,7 @@ impl WorkerControl {
         Arc::new(Self {
             stop: AtomicBool::new(false),
             paused: AtomicBool::new(initially_paused),
+            cuda_failed: AtomicBool::new(false),
             cv_lock: Mutex::new(()),
             cv: Condvar::new(),
             child_pid: AtomicI32::new(0),
@@ -246,6 +251,15 @@ impl WorkerControl {
 
     pub fn should_stop(&self) -> bool {
         self.stop.load(Ordering::Acquire)
+    }
+
+    pub fn cuda_failed(&self) -> bool {
+        self.cuda_failed.load(Ordering::Acquire)
+    }
+
+    pub fn request_cuda_fallback(&self) {
+        self.cuda_failed.store(true, Ordering::Release);
+        self.cv.notify_all();
     }
 
     pub fn is_paused(&self) -> bool {
