@@ -236,7 +236,11 @@ fn stream_cuda_session(
     mailbox: &FrameMailbox,
 ) -> Result<()> {
     // The GPU bridge currently supports exactly two even-sized NV12 planes.
-    if probe.width < 2 || probe.height < 2 || probe.width % 2 != 0 || probe.height % 2 != 0 {
+    if probe.width < 2
+        || probe.height < 2
+        || !probe.width.is_multiple_of(2)
+        || !probe.height.is_multiple_of(2)
+    {
         bail!("CUDA interop does not support odd video dimensions");
     }
     let mut decoder = super::gst_cuda::CudaDecoder::open(path, probe.colorspace)?;

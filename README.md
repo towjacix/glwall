@@ -16,6 +16,10 @@ Or via [cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
 cargo binstall --git https://github.com/towjacix/glwall glwall
 ```
 
+The NVIDIA fast path requires GStreamer 1.24 or newer with the base, good,
+bad/nvcodec plugins and the NVIDIA CUDA driver. FFmpeg and ffprobe remain
+required for probing and for fallback on unsupported systems or formats.
+
 ## Features
 
 - **Custom GLSL Shaders (`.frag`)**: Hot-reload via canonical path `inotify` (keeps old shader on compile errors), unified `sampleWallpaper(uv)`, `samplePrevWallpaper(uv)`, `wallpaperUv(uv)`, and `sampleTextureFitted(tex, tex_size, uv)` preamble across images, animations, and NV12 videos, FBO transition + post-shader composition, plus automatic **Shadertoy (`mainImage`)** compatibility.

@@ -170,8 +170,8 @@ impl CudaTextures {
             if let Err(err) = self.pop() {
                 error.get_or_insert(err);
             }
-            if error.is_some() {
-                return Err(error.unwrap());
+            if let Some(err) = error {
+                return Err(err);
             }
             unsafe {
                 (self.api.object_unref)(self.cuda_context);
@@ -202,8 +202,8 @@ impl CudaTextures {
             || frame.device_ptr == 0
             || frame.width < 2
             || frame.height < 2
-            || frame.width % 2 != 0
-            || frame.height % 2 != 0
+            || !frame.width.is_multiple_of(2)
+            || !frame.height.is_multiple_of(2)
             || frame.y_stride < frame.width as usize
             || frame.uv_stride < frame.width as usize
         {

@@ -259,8 +259,8 @@ impl CudaFrame {
             let meta = &*meta;
             if meta.width < 2
                 || meta.height < 2
-                || meta.width % 2 != 0
-                || meta.height % 2 != 0
+                || !meta.width.is_multiple_of(2)
+                || !meta.height.is_multiple_of(2)
                 || meta.n_planes != 2
                 || meta.stride[0] < meta.width as i32
                 || meta.stride[1] < meta.width as i32
