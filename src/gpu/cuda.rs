@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn partially_registered_resources_force_reinitialization() {
-        let texture = glow::Texture(std::num::NonZeroU32::new(7).unwrap());
+        let texture = glow::NativeTexture(std::num::NonZeroU32::new(7).unwrap());
         let textures = Some([texture, texture]);
         let registered = 0xdeadbeefusize as Resource;
         assert!(has_unregistered_resources(

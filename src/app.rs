@@ -75,6 +75,31 @@ impl OutputEntry {
         }
         self.custom_program.as_ref().is_some_and(|p| p.uses_time)
     }
+
+    /// Extracts the GPU-owned resources, leaving `self` free to be torn down.
+    fn gpu_parts(&mut self) -> DeferredOutputGpu {
+        DeferredOutputGpu {
+            name: self.name.clone(),
+            pending_apply: self.pending_apply.take(),
+            slot0: std::mem::replace(&mut self.slot0, MediaSlotGpu::empty()),
+            slot1: self.slot1.take(),
+            custom_program: self.custom_program.take(),
+            transition_program: self.transition_program.take(),
+            custom_textures: std::mem::take(&mut self.custom_textures),
+        }
+    }
+}
+
+/// GPU-owned resources extracted from an [`OutputEntry`] whose Wayland/EGL
+/// surface was already torn down. Deferred until a GL context can be bound.
+struct DeferredOutputGpu {
+    name: String,
+    pending_apply: Option<PendingApply>,
+    slot0: MediaSlotGpu,
+    slot1: Option<MediaSlotGpu>,
+    custom_program: Option<GlProgram>,
+    transition_program: Option<GlProgram>,
+    custom_textures: BTreeMap<String, TextureId>,
 }
 
 enum StagedShader {
@@ -168,7 +193,7 @@ pub struct AppCore {
     texture_pool: TexturePool,
     inflight_tex_decodes: HashSet<TextureKey>,
     outputs: Vec<OutputEntry>,
-    deferred_outputs: Vec<OutputEntry>,
+    deferred_outputs: Vec<DeferredOutputGpu>,
     deferred_applies: Vec<PendingApply>,
     deferred_slots: Vec<MediaSlotGpu>,
     deferred_programs: Vec<GlProgram>,
@@ -366,26 +391,30 @@ impl AppCore {
         }
     }
 
-    fn release_output_gpu(&mut self, entry: &mut OutputEntry) {
-        if let Some(pending) = entry.pending_apply.take() {
+    fn release_gpu_parts(&mut self, gpu: &mut DeferredOutputGpu) {
+        if let Some(pending) = gpu.pending_apply.take() {
             self.release_pending_bound(pending);
         }
         if let Some(r) = &mut self.renderer {
-            r.remove_output_cache(&entry.name);
-            std::mem::replace(&mut entry.slot0, MediaSlotGpu::empty()).destroy(&r.gl);
-            if let Some(slot) = entry.slot1.take() {
+            r.remove_output_cache(&gpu.name);
+            std::mem::replace(&mut gpu.slot0, MediaSlotGpu::empty()).destroy(&r.gl);
+            if let Some(slot) = gpu.slot1.take() {
                 slot.destroy(&r.gl);
             }
-            if let Some(program) = entry.custom_program.take() {
+            if let Some(program) = gpu.custom_program.take() {
                 program.destroy(&r.gl);
             }
-            if let Some(program) = entry.transition_program.take() {
+            if let Some(program) = gpu.transition_program.take() {
                 program.destroy(&r.gl);
             }
-            for (_, id) in std::mem::take(&mut entry.custom_textures) {
+            for (_, id) in std::mem::take(&mut gpu.custom_textures) {
                 self.texture_pool.release(&r.gl, id);
             }
         }
+    }
+
+    fn release_output_gpu(&mut self, entry: &mut OutputEntry) {
+        self.release_gpu_parts(&mut entry.gpu_parts());
     }
 
     fn drain_deferred_gpu(&mut self) {
@@ -395,8 +424,8 @@ impl AppCore {
         for pending in std::mem::take(&mut self.deferred_applies) {
             self.release_pending_bound(pending);
         }
-        for mut entry in std::mem::take(&mut self.deferred_outputs) {
-            self.release_output_gpu(&mut entry);
+        for mut gpu in std::mem::take(&mut self.deferred_outputs) {
+            self.release_gpu_parts(&mut gpu);
         }
         let gl = &self.renderer.as_ref().unwrap().gl;
         for slot in self.deferred_slots.drain(..) {
@@ -2055,8 +2084,9 @@ impl AppCore {
                 "cannot bind EGL context to clean up output {}; deferring GPU cleanup",
                 entry.name
             );
+            let gpu = entry.gpu_parts();
             entry.surface.teardown(&self.egl);
-            self.deferred_outputs.push(entry);
+            self.deferred_outputs.push(gpu);
             return;
         }
         self.drain_deferred_gpu();
