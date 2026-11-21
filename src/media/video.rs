@@ -1135,7 +1135,7 @@ mod tests {
     #[ignore = "requires NVIDIA CUDA/NVDEC, GStreamer CUDA, and FFmpeg with libx264"]
     fn cuda_one_frame_pause_through_eos_does_not_fallback() {
         let fixture = FixtureDir::new();
-        let source = fixture.source(32, 24, "libx264");
+        let source = fixture.source(64, 64, "libx264");
         let (sender, _receiver) = calloop::channel::channel();
         let mailbox = FrameMailbox::new(sender, String::new(), 0);
         let control = WorkerControl::new(false);
