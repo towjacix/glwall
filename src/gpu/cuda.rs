@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use glow::HasContext;
 use libloading::Library;
 
-use crate::media::gst_cuda::MappedCudaFrame;
+use crate::media::gst_cuda::{CudaSourceInFlight, MappedCudaFrame};
 
 type CuResult = c_int;
 type Resource = *mut c_void;
@@ -45,6 +45,7 @@ struct Api {
     unmap: unsafe extern "C" fn(c_uint, *mut Resource, *mut c_void) -> CuResult,
     array: unsafe extern "C" fn(*mut *mut c_void, Resource, c_uint, c_uint) -> CuResult,
     copy: unsafe extern "C" fn(*const Copy2d) -> CuResult,
+    synchronize: unsafe extern "C" fn() -> CuResult,
     push: unsafe extern "C" fn(ContextHandle) -> c_int,
     pop: unsafe extern "C" fn(*mut ContextHandle) -> c_int,
     object_ref: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
@@ -67,6 +68,7 @@ impl Api {
             let unmap = *cuda.get(b"cuGraphicsUnmapResources\0")?;
             let array = *cuda.get(b"cuGraphicsSubResourceGetMappedArray\0")?;
             let copy = *cuda.get(b"cuMemcpy2D_v2\0")?;
+            let synchronize = *cuda.get(b"cuCtxSynchronize\0")?;
             let push = *gst_cuda.get(b"gst_cuda_context_push\0")?;
             let pop = *gst_cuda.get(b"gst_cuda_context_pop\0")?;
             let object_ref = *gobject.get(b"g_object_ref\0")?;
@@ -84,6 +86,7 @@ impl Api {
                 unmap,
                 array,
                 copy,
+                synchronize,
                 push,
                 pop,
                 object_ref,
@@ -102,6 +105,46 @@ fn check(operation: &str, code: CuResult) -> Result<()> {
     } else {
         Err(anyhow!("{operation} failed with CUDA error {code}"))
     }
+}
+
+fn combine_results(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
+    match (primary, cleanup) {
+        (Err(err), Err(cleanup)) => Err(err.context(format!("cleanup also failed: {cleanup:#}"))),
+        (Err(err), _) | (_, Err(err)) => Err(err),
+        _ => Ok(()),
+    }
+}
+
+fn finish_mapped_copy(
+    copy: Result<()>,
+    sync: impl FnOnce() -> Result<()>,
+    unmap: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let sync = sync();
+    let unmap = unmap();
+    match sync {
+        Ok(()) => combine_results(copy, unmap),
+        Err(sync_err) => {
+            let mut detail = format!("{sync_err:#}");
+            if let Err(err) = copy {
+                detail.push_str(&format!("; copy failed: {err:#}"));
+            }
+            if let Err(err) = unmap {
+                detail.push_str(&format!("; unmap failed: {err:#}"));
+            }
+            Err(CudaSourceInFlight(anyhow!("{detail}")).into())
+        }
+    }
+}
+
+/// True when textures were created but graphics-resource registration did not
+/// complete for both planes. Upload must reinitialize rather than pass a null
+/// `CUgraphicsResource` to `cuGraphicsMapResources`.
+fn has_unregistered_resources(
+    textures: Option<&[glow::Texture; 2]>,
+    resources: &[Resource; 2],
+) -> bool {
+    textures.is_some() && resources.contains(&ptr::null_mut())
 }
 
 /// The graphics resources are tied to the current EGL context. The owner must
@@ -213,6 +256,7 @@ impl CudaTextures {
             || self.cuda_context != frame.context
             || self.width != frame.width
             || self.height != frame.height
+            || has_unregistered_resources(self.textures.as_ref(), &self.resources)
         {
             self.clear(gl)?;
             self.cuda_context = unsafe { (self.api.object_ref)(frame.context) };
@@ -272,27 +316,30 @@ impl CudaTextures {
                 }
                 gl.bind_texture(glow::TEXTURE_2D, None);
             }
-            self.push()?;
-            let mut registration_error = None;
-            for (index, texture) in [y, uv].iter().enumerate() {
-                if let Err(err) = check("cuGraphicsGLRegisterImage", unsafe {
-                    (self.api.register)(
-                        &mut self.resources[index],
-                        texture.0.get(),
-                        glow::TEXTURE_2D,
-                        2,
-                    )
-                }) {
-                    registration_error = Some(err);
-                    break;
+            // Roll back on any failure so a retry cannot observe textures that
+            // were never registered as CUDA graphics resources.
+            let init = (|| {
+                self.push()?;
+                let mut registration_error = None;
+                for (index, texture) in [y, uv].iter().enumerate() {
+                    if let Err(err) = check("cuGraphicsGLRegisterImage", unsafe {
+                        (self.api.register)(
+                            &mut self.resources[index],
+                            texture.0.get(),
+                            glow::TEXTURE_2D,
+                            2,
+                        )
+                    }) {
+                        registration_error = Some(err);
+                        break;
+                    }
                 }
+                let registration = registration_error.map_or(Ok(()), Err);
+                combine_results(registration, self.pop())
+            })();
+            if init.is_err() {
+                return Err(combine_results(init, self.clear(gl)).unwrap_err());
             }
-            let pop_result = self.pop();
-            if let Some(err) = registration_error {
-                let _ = self.clear(gl);
-                return Err(err);
-            }
-            pop_result?;
         }
         self.push()?;
         let result = (|| {
@@ -326,18 +373,96 @@ impl CudaTextures {
                 }
                 Ok(())
             })();
-            let unmap = check("cuGraphicsUnmapResources", unsafe {
-                (self.api.unmap)(2, self.resources.as_mut_ptr(), ptr::null_mut())
-            });
-            result.and(unmap)
+            // Device-to-device cuMemcpy2D can return before the source reads
+            // complete, including when a later plane copy fails.
+            finish_mapped_copy(
+                result,
+                || check("cuCtxSynchronize", unsafe { (self.api.synchronize)() }),
+                || {
+                    check("cuGraphicsUnmapResources", unsafe {
+                        (self.api.unmap)(2, self.resources.as_mut_ptr(), ptr::null_mut())
+                    })
+                },
+            )
         })();
         let pop = self.pop();
-        result.and(pop)?;
+        combine_results(result, pop)?;
         let textures = self.textures.context("CUDA textures missing")?;
         Ok((textures[0], textures[1]))
     }
 
-    pub fn destroy(mut self, gl: &glow::Context) -> Result<()> {
+    pub fn destroy(&mut self, gl: &glow::Context) -> Result<()> {
         self.clear(gl)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_copy_failure_still_synchronizes_before_unmapping() {
+        let order = std::cell::RefCell::new(Vec::new());
+        let err = finish_mapped_copy(
+            Err(anyhow!("second plane failed")),
+            || {
+                order.borrow_mut().push("sync");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("unmap");
+                Err(anyhow!("unmap failed"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(*order.borrow(), ["sync", "unmap"]);
+        let message = format!("{err:#}");
+        assert!(message.contains("second plane failed"));
+        assert!(message.contains("unmap failed"));
+    }
+
+    #[test]
+    fn failed_sync_marks_source_for_quarantine_even_if_unmap_fails() {
+        let err = finish_mapped_copy(
+            Err(anyhow!("copy failed")),
+            || Err(anyhow!("sync failed")),
+            || Err(anyhow!("unmap failed")),
+        )
+        .unwrap_err();
+        assert!(err.downcast_ref::<CudaSourceInFlight>().is_some());
+        let message = format!("{err:#}");
+        for expected in ["copy failed", "sync failed", "unmap failed"] {
+            assert!(message.contains(expected));
+        }
+    }
+
+    #[test]
+    fn reports_primary_and_cleanup_errors_without_losing_marker() {
+        let primary: anyhow::Error = CudaSourceInFlight(anyhow!("sync failed")).into();
+        let err = combine_results(Err(primary), Err(anyhow!("pop failed"))).unwrap_err();
+        assert!(err.downcast_ref::<CudaSourceInFlight>().is_some());
+        let message = format!("{err:#}");
+        assert!(message.contains("sync failed"));
+        assert!(message.contains("pop failed"));
+    }
+
+    #[test]
+    fn partially_registered_resources_force_reinitialization() {
+        let texture = glow::Texture(std::num::NonZeroU32::new(7).unwrap());
+        let textures = Some([texture, texture]);
+        let registered = 0xdeadbeefusize as Resource;
+        assert!(has_unregistered_resources(
+            textures.as_ref(),
+            &[registered, ptr::null_mut()]
+        ));
+        assert!(!has_unregistered_resources(
+            textures.as_ref(),
+            &[registered, registered]
+        ));
+        // No textures yet means the first re-init condition already applies.
+        assert!(!has_unregistered_resources(
+            None,
+            &[ptr::null_mut(), ptr::null_mut()]
+        ));
     }
 }

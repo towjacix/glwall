@@ -168,6 +168,10 @@ pub struct AppCore {
     texture_pool: TexturePool,
     inflight_tex_decodes: HashSet<TextureKey>,
     outputs: Vec<OutputEntry>,
+    deferred_outputs: Vec<OutputEntry>,
+    deferred_applies: Vec<PendingApply>,
+    deferred_slots: Vec<MediaSlotGpu>,
+    deferred_programs: Vec<GlProgram>,
     next_output_index: i32,
     pause: PauseState,
     fullscreen_outputs: HashSet<String>,
@@ -216,6 +220,10 @@ fn connect_wayland_and_egl(
             texture_pool: TexturePool::new(),
             inflight_tex_decodes: HashSet::new(),
             outputs: Vec::new(),
+            deferred_outputs: Vec::new(),
+            deferred_applies: Vec::new(),
+            deferred_slots: Vec::new(),
+            deferred_programs: Vec::new(),
             next_output_index: 0,
             pause: PauseState::new(),
             fullscreen_outputs: HashSet::new(),
@@ -247,11 +255,13 @@ impl AppCore {
             let gl = self.egl.create_glow_context()?;
             self.renderer = Some(Renderer::new(gl)?);
         }
+        self.drain_deferred_gpu();
         Ok(true)
     }
 
     fn ensure_any_gl_context(&mut self) -> Result<()> {
         if self.renderer.is_some() && self.egl.make_current_surfaceless().is_ok() {
+            self.drain_deferred_gpu();
             return Ok(());
         }
         for i in 0..self.outputs.len() {
@@ -264,23 +274,22 @@ impl AppCore {
             && let Ok(r) = Renderer::new(gl)
         {
             self.renderer = Some(r);
+            self.drain_deferred_gpu();
             return Ok(());
         }
         bail!("no Wayland EGL surface or surfaceless context available yet")
     }
 
-    fn bind_cleanup_gl_context(&mut self, skip_output_idx: Option<usize>) {
+    fn bind_cleanup_gl_context(&mut self) -> Result<()> {
         if self.egl.make_current_surfaceless().is_ok() {
-            return;
+            return Ok(());
         }
         for i in 0..self.outputs.len() {
-            if skip_output_idx == Some(i) {
-                continue;
-            }
             if matches!(self.ensure_renderer_on_surface(i), Ok(true)) {
-                return;
+                return Ok(());
             }
         }
+        bail!("no EGL context available for GPU cleanup")
     }
 
     fn find_output_by_surface(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
@@ -334,8 +343,20 @@ impl AppCore {
         }
     }
 
-    fn release_pending_apply(&mut self, mut pending: PendingApply, reason: Option<&str>) {
-        if let Some(ref r) = self.renderer {
+    fn release_pending_apply(&mut self, pending: PendingApply, reason: Option<&str>) {
+        if self.renderer.is_some()
+            && let Err(err) = self.ensure_any_gl_context()
+        {
+            tracing::warn!("deferring staged GPU cleanup: {err:#}");
+            self.deferred_applies.push(pending);
+            return;
+        }
+        self.release_pending_bound(pending);
+        let _ = reason;
+    }
+
+    fn release_pending_bound(&mut self, mut pending: PendingApply) {
+        if let Some(r) = &self.renderer {
             if let StagedShader::Set { program, .. } = pending.shader {
                 (*program).destroy(&r.gl);
             }
@@ -343,7 +364,48 @@ impl AppCore {
                 self.texture_pool.release(&r.gl, id);
             }
         }
-        let _ = (reason, pending.revision);
+    }
+
+    fn release_output_gpu(&mut self, entry: &mut OutputEntry) {
+        if let Some(pending) = entry.pending_apply.take() {
+            self.release_pending_bound(pending);
+        }
+        if let Some(r) = &mut self.renderer {
+            r.remove_output_cache(&entry.name);
+            std::mem::replace(&mut entry.slot0, MediaSlotGpu::empty()).destroy(&r.gl);
+            if let Some(slot) = entry.slot1.take() {
+                slot.destroy(&r.gl);
+            }
+            if let Some(program) = entry.custom_program.take() {
+                program.destroy(&r.gl);
+            }
+            if let Some(program) = entry.transition_program.take() {
+                program.destroy(&r.gl);
+            }
+            for (_, id) in std::mem::take(&mut entry.custom_textures) {
+                self.texture_pool.release(&r.gl, id);
+            }
+        }
+    }
+
+    fn drain_deferred_gpu(&mut self) {
+        if self.renderer.is_none() {
+            return;
+        }
+        for pending in std::mem::take(&mut self.deferred_applies) {
+            self.release_pending_bound(pending);
+        }
+        for mut entry in std::mem::take(&mut self.deferred_outputs) {
+            self.release_output_gpu(&mut entry);
+        }
+        let gl = &self.renderer.as_ref().unwrap().gl;
+        for slot in self.deferred_slots.drain(..) {
+            slot.destroy(gl);
+        }
+        for program in self.deferred_programs.drain(..) {
+            program.destroy(gl);
+        }
+        crate::gpu::renderer::retry_retired_cuda(gl);
     }
 
     fn cancel_output_pending(&mut self, idx: usize, reason: &str) {
@@ -536,6 +598,9 @@ impl AppCore {
             if !val.is_finite() {
                 bail!("uniform '{name}' has non-finite value");
             }
+        }
+        if self.renderer.is_some() && tx.media.is_some() {
+            self.ensure_any_gl_context()?;
         }
 
         // Pre-validate and compile everything per-output before mutating any live state.
@@ -748,6 +813,7 @@ impl AppCore {
                 self.ensure_any_gl_context()?;
                 let gl = &self.renderer.as_ref().unwrap().gl;
                 let entry = &mut self.outputs[idx];
+                entry.slot0.try_clear(gl)?;
                 entry.generation += 1;
                 if let Some(job) = entry.job.take() {
                     job.stop();
@@ -755,7 +821,6 @@ impl AppCore {
                 if let Some(prev) = entry.prev_job.take() {
                     prev.stop();
                 }
-                entry.slot0.clear(gl);
                 if let Some(s1) = entry.slot1.take() {
                     s1.destroy(gl);
                 }
@@ -781,6 +846,13 @@ impl AppCore {
                     target_override = Some(abs.to_string_lossy().to_string());
                 }
             } else if let Some((resolved_target, kind, media)) = prep.resolved_media {
+                if prep.transition_prog.is_none() {
+                    if let Some(r) = &self.renderer {
+                        self.outputs[idx].slot0.try_clear(&r.gl)?;
+                    } else {
+                        self.outputs[idx].slot0 = MediaSlotGpu::empty();
+                    }
+                }
                 let entry = &mut self.outputs[idx];
                 entry.generation += 1;
                 let generation = entry.generation;
@@ -825,11 +897,6 @@ impl AppCore {
                 } else {
                     if let Some(old_job) = entry.job.take() {
                         old_job.stop();
-                    }
-                    if let Some(ref r) = self.renderer {
-                        entry.slot0.clear(&r.gl);
-                    } else {
-                        entry.slot0 = MediaSlotGpu::empty();
                     }
                     entry.waiting_target_frame = false;
                     entry.in_transition = false;
@@ -956,12 +1023,16 @@ impl AppCore {
             return;
         }
 
+        if self.renderer.is_some()
+            && let Err(err) = self.ensure_any_gl_context()
+        {
+            tracing::warn!("deferring pending apply until EGL context is available: {err:#}");
+            return;
+        }
+
         let mut pending = self.outputs[idx].pending_apply.take().unwrap();
 
         let (shader_changed, persist_now, out_name, spec_snapshot) = {
-            if !matches!(pending.shader, StagedShader::Keep) {
-                let _ = self.ensure_any_gl_context();
-            }
             let gl_opt = self.renderer.as_ref().map(|r| &r.gl);
             let entry = &mut self.outputs[idx];
             let mut sh_changed = false;
@@ -1184,7 +1255,11 @@ impl AppCore {
                 let Some(idx) = self.outputs.iter().position(|o| o.name == output) else {
                     return;
                 };
-                if self.outputs[idx].generation != generation {
+                if !self.outputs[idx]
+                    .job
+                    .as_ref()
+                    .is_some_and(|job| job.generation == generation)
+                {
                     return;
                 }
                 tracing::error!("media error on {output}: {message}");
@@ -1211,18 +1286,15 @@ impl AppCore {
                         failed_job.stop();
                     }
                     entry.job = entry.prev_job.take();
-                    if let Some(prev_slot) = entry.slot1.take() {
-                        if let Some(ref r) = self.renderer {
-                            let old = std::mem::replace(&mut entry.slot0, prev_slot);
-                            old.destroy(&r.gl);
-                        } else {
-                            entry.slot0 = prev_slot;
-                        }
+                    if let Some(job) = &entry.job {
+                        job.set_paused(self.pause.is_paused(&entry.name));
                     }
-                    if let Some(tr) = entry.transition_program.take()
-                        && let Some(ref r) = self.renderer
-                    {
-                        tr.destroy(&r.gl);
+                    if let Some(prev_slot) = entry.slot1.take() {
+                        let old = std::mem::replace(&mut entry.slot0, prev_slot);
+                        self.deferred_slots.push(old);
+                    }
+                    if let Some(tr) = entry.transition_program.take() {
+                        self.deferred_programs.push(tr);
                     }
                     entry.surface.dirty = true;
                     self.render_if_ready(idx, qh);
@@ -1232,7 +1304,11 @@ impl AppCore {
                 let Some(idx) = self.outputs.iter().position(|o| o.name == output) else {
                     return;
                 };
-                if self.outputs[idx].generation != generation {
+                if !self.outputs[idx]
+                    .job
+                    .as_ref()
+                    .is_some_and(|job| job.generation == generation)
+                {
                     return;
                 }
                 let mailbox_opt = if self.outputs[idx]
@@ -1435,6 +1511,19 @@ impl AppCore {
         idx: usize,
         qh: &wayland_client::QueueHandle<WaylandContext<Self>>,
     ) {
+        if self.outputs[idx]
+            .pending_apply
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.is_ready(
+                    self.outputs[idx].generation,
+                    self.outputs[idx].slot0_has_first_frame,
+                )
+            })
+        {
+            self.try_commit_pending_apply(idx, qh);
+            return;
+        }
         let entry = &self.outputs[idx];
         let paused = self.pause.is_paused(&entry.name);
         let continuous = !paused && entry.uses_continuous_frames();
@@ -1955,43 +2044,62 @@ impl AppCore {
         if let Some(prev) = entry.prev_job.take() {
             prev.stop();
         }
-        if let Some(pending) = entry.pending_apply.take() {
-            self.release_pending_apply(pending, Some("output removed"));
+        let bound = self.bind_cleanup_gl_context().is_ok()
+            || entry.surface.egl_surface.is_some_and(|surface| {
+                self.egl
+                    .make_current_surface(surface, &mut entry.surface.swap_interval_set)
+                    .is_ok()
+            });
+        if self.renderer.is_some() && !bound {
+            tracing::error!(
+                "cannot bind EGL context to clean up output {}; deferring GPU cleanup",
+                entry.name
+            );
+            entry.surface.teardown(&self.egl);
+            self.deferred_outputs.push(entry);
+            return;
         }
-        self.bind_cleanup_gl_context(None);
-        if let Some(ref mut r) = self.renderer {
-            r.remove_output_cache(&entry.name);
-            entry.slot0.destroy(&r.gl);
-            if let Some(s1) = entry.slot1.take() {
-                s1.destroy(&r.gl);
-            }
-            if let Some(p) = entry.custom_program.take() {
-                p.destroy(&r.gl);
-            }
-            if let Some(tr) = entry.transition_program.take() {
-                tr.destroy(&r.gl);
-            }
-            for (_, tex_id) in std::mem::take(&mut entry.custom_textures) {
-                self.texture_pool.release(&r.gl, tex_id);
-            }
+        self.drain_deferred_gpu();
+        self.release_output_gpu(&mut entry);
+        if let Some(r) = &self.renderer {
+            crate::gpu::renderer::retry_retired_cuda(&r.gl);
+        }
+        if self.outputs.is_empty()
+            && let Some(r) = self.renderer.take()
+        {
+            let pool = std::mem::take(&mut self.texture_pool);
+            pool.destroy(&r.gl);
+            r.destroy();
         }
         entry.surface.teardown(&self.egl);
     }
 
     fn shutdown(&mut self) {
-        let entries = std::mem::take(&mut self.outputs);
-        for entry in entries {
+        while let Some(entry) = self.outputs.pop() {
             self.teardown_output_entry(entry);
         }
         for waiter in std::mem::take(&mut self.commit_waiters) {
             self.ipc_hub
                 .complete_pending_ack(waiter.client_id, &IpcResponse::err("daemon shutting down"));
         }
-        let pool = std::mem::take(&mut self.texture_pool);
-        if let Some(r) = self.renderer.take() {
-            let _ = self.egl.make_current_surfaceless();
-            pool.destroy(&r.gl);
-            r.destroy();
+        if self.renderer.is_some() {
+            if let Err(err) = self.egl.make_current_surfaceless() {
+                tracing::error!(
+                    "cannot bind EGL context for renderer shutdown; retaining GPU owners: {err:#}"
+                );
+                std::mem::forget(std::mem::take(&mut self.deferred_outputs));
+                std::mem::forget(std::mem::take(&mut self.deferred_applies));
+                std::mem::forget(std::mem::take(&mut self.deferred_slots));
+                std::mem::forget(std::mem::take(&mut self.deferred_programs));
+                std::mem::forget(std::mem::take(&mut self.texture_pool));
+                std::mem::forget(self.renderer.take());
+            } else {
+                self.drain_deferred_gpu();
+                let pool = std::mem::take(&mut self.texture_pool);
+                let r = self.renderer.take().unwrap();
+                pool.destroy(&r.gl);
+                r.destroy();
+            }
         }
         self.egl.unbind_context();
     }

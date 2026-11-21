@@ -3,7 +3,7 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::path::Path;
 use std::ptr;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -96,6 +96,7 @@ struct Api {
     seek: unsafe extern "C" fn(Ptr, c_int, c_uint, i64) -> c_int,
     unref_object: unsafe extern "C" fn(Ptr),
     unref_mini: unsafe extern "C" fn(Ptr),
+    ref_mini: unsafe extern "C" fn(Ptr) -> Ptr,
     pull: unsafe extern "C" fn(Ptr, u64) -> Ptr,
     sample_buffer: unsafe extern "C" fn(Ptr) -> Ptr,
     memory_count: unsafe extern "C" fn(Ptr) -> c_uint,
@@ -127,6 +128,7 @@ impl Api {
             let seek = *gst.get(b"gst_element_seek_simple\0")?;
             let unref_object = *gst.get(b"gst_object_unref\0")?;
             let unref_mini = *gst.get(b"gst_mini_object_unref\0")?;
+            let ref_mini = *gst.get(b"gst_mini_object_ref\0")?;
             let pull = *app.get(b"gst_app_sink_try_pull_sample\0")?;
             let sample_buffer = *gst.get(b"gst_sample_get_buffer\0")?;
             let memory_count = *gst.get(b"gst_buffer_n_memory\0")?;
@@ -154,6 +156,7 @@ impl Api {
                 seek,
                 unref_object,
                 unref_mini,
+                ref_mini,
                 pull,
                 sample_buffer,
                 memory_count,
@@ -214,6 +217,23 @@ pub struct MappedCudaFrame {
     pub y_offset: usize,
     pub uv_offset: usize,
 }
+
+/// Indicates that a CUDA read may still be using the mapped source.
+#[derive(Debug)]
+pub(crate) struct CudaSourceInFlight(pub anyhow::Error);
+
+impl std::fmt::Display for CudaSourceInFlight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CUDA source completion failed: {:#}", self.0)
+    }
+}
+
+impl std::error::Error for CudaSourceInFlight {}
+
+// A failed context synchronization cannot prove the decoder allocation is no
+// longer in use. Quarantine at most one mapping for the lifetime of the process
+// and reject further CUDA uploads, rather than unmapping memory still in use.
+static SOURCE_QUARANTINED: Mutex<bool> = Mutex::new(false);
 
 pub struct CudaFrame {
     api: Arc<Api>,
@@ -289,6 +309,10 @@ impl CudaFrame {
     }
 
     pub fn with_mapped<T>(&self, f: impl FnOnce(&MappedCudaFrame) -> Result<T>) -> Result<T> {
+        let mut quarantined = SOURCE_QUARANTINED.lock().unwrap_or_else(|e| e.into_inner());
+        if *quarantined {
+            bail!("CUDA source quarantined after synchronization failure; CUDA uploads disabled");
+        }
         let mut map: GstMapInfo = unsafe { std::mem::zeroed() };
         unsafe {
             (self.api.cuda_sync)(self.memory);
@@ -337,7 +361,20 @@ impl CudaFrame {
             y_offset: self.y_offset,
             uv_offset: self.uv_offset,
         };
-        f(&frame)
+        let result = f(&frame);
+        if result
+            .as_ref()
+            .is_err_and(|err| err.downcast_ref::<CudaSourceInFlight>().is_some())
+        {
+            unsafe { (self.api.ref_mini)(self.sample) };
+            // Keep the library loaded and never unmap this source: its CUDA
+            // context may have failed while reads were still in flight.
+            std::mem::forget(Arc::clone(&self.api));
+            std::mem::forget(guard);
+            *quarantined = true;
+            tracing::error!("quarantined one mapped CUDA sample until process exit");
+        }
+        result
     }
 }
 

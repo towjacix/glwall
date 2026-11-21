@@ -109,6 +109,8 @@ fn decode_ffmpeg_static_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
         .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
         .arg(path)
         .args([
+            "-map",
+            "0:v:0",
             "-frames:v",
             "1",
             "-f",

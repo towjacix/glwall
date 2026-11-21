@@ -808,6 +808,43 @@ pub struct MediaSlotGpu {
     cuda_binding: Option<(glow::Texture, glow::Texture)>,
 }
 
+static CUDA_CLEANUP_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    // This renderer is confined to its EGL thread. ManuallyDrop keeps failed
+    // driver registrations and their libraries alive even at thread shutdown.
+    static RETIRED_CUDA: std::cell::RefCell<std::mem::ManuallyDrop<Vec<crate::gpu::cuda::CudaTextures>>> =
+        std::cell::RefCell::new(std::mem::ManuallyDrop::new(Vec::new()));
+}
+
+pub(crate) fn retry_retired_cuda(gl: &glow::Context) {
+    RETIRED_CUDA.with(|retired| {
+        retired.borrow_mut().retain_mut(|textures| {
+            if let Err(err) = textures.destroy(gl) {
+                tracing::debug!("retired CUDA cleanup still pending: {err:#}");
+                true
+            } else {
+                false
+            }
+        });
+    });
+}
+fn retire_owned<T>(
+    owner: &mut Option<T>,
+    retired: &mut Vec<T>,
+    clear: impl FnOnce(&mut T) -> Result<()>,
+) -> bool {
+    if let Some(mut value) = owner.take()
+        && let Err(err) = clear(&mut value)
+    {
+        tracing::error!("CUDA texture cleanup failed; retaining resources for retry: {err:#}");
+        retired.push(value);
+        return true;
+    }
+    false
+}
+
 impl MediaSlotGpu {
     pub fn empty() -> Self {
         Self {
@@ -854,13 +891,15 @@ impl MediaSlotGpu {
         fit: FitMode,
         pixels: &[u8],
     ) -> Result<()> {
-        self.clear_nv12(gl);
         if self.rgba_tex.is_none() {
             self.rgba_tex = Some(OwnedTexture::new(gl)?);
         }
         if let Some(tex) = &mut self.rgba_tex {
             tex.upload_rgba(gl, width, height, pixels);
         }
+        // The old CUDA binding remains usable until the replacement exists.
+        self.retire_cuda(gl);
+        self.clear_cpu_nv12(gl);
         self.kind = SlotMediaKind::Rgba;
         self.width = width;
         self.height = height;
@@ -879,8 +918,6 @@ impl MediaSlotGpu {
         y_plane: &[u8],
         uv_plane: &[u8],
     ) -> Result<()> {
-        self.clear_cuda(gl);
-        self.clear_rgba(gl);
         if self.y_tex.is_none() {
             self.y_tex = Some(OwnedTexture::new(gl)?);
         }
@@ -895,6 +932,9 @@ impl MediaSlotGpu {
         {
             ring.upload_nv12(gl, y_tex, uv_tex, width, height, y_plane, uv_plane);
         }
+        // Do not let a failed CUDA unregister prevent CPU fallback.
+        self.retire_cuda(gl);
+        self.clear_rgba(gl);
         self.kind = SlotMediaKind::Nv12;
         self.width = width;
         self.height = height;
@@ -909,6 +949,9 @@ impl MediaSlotGpu {
         frame: &crate::media::gst_cuda::CudaFrame,
         fit: FitMode,
     ) -> Result<()> {
+        if CUDA_CLEANUP_FAILED.load(std::sync::atomic::Ordering::Acquire) {
+            bail!("CUDA uploads disabled after a graphics-resource cleanup failure");
+        }
         if self.cuda_staging.is_none() {
             self.cuda_staging = Some(crate::gpu::cuda::CudaTextures::new()?);
         }
@@ -927,11 +970,18 @@ impl MediaSlotGpu {
     }
 
     pub fn clear(&mut self, gl: &glow::Context) {
+        if let Err(err) = self.try_clear(gl) {
+            tracing::error!("CUDA texture cleanup failed: {err:#}");
+        }
+    }
+
+    pub fn try_clear(&mut self, gl: &glow::Context) -> Result<()> {
+        self.clear_nv12(gl)?;
         self.clear_rgba(gl);
-        self.clear_nv12(gl);
         self.kind = SlotMediaKind::None;
         self.width = 0;
         self.height = 0;
+        Ok(())
     }
 
     fn clear_rgba(&mut self, gl: &glow::Context) {
@@ -940,23 +990,31 @@ impl MediaSlotGpu {
         }
     }
 
-    fn clear_nv12(&mut self, gl: &glow::Context) {
-        self.clear_cuda(gl);
+    fn clear_nv12(&mut self, gl: &glow::Context) -> Result<()> {
+        self.clear_cuda(gl)?;
         self.clear_cpu_nv12(gl);
+        Ok(())
     }
 
-    fn clear_cuda(&mut self, gl: &glow::Context) {
+    fn clear_cuda(&mut self, gl: &glow::Context) -> Result<()> {
+        self.retire_cuda(gl);
+        Ok(())
+    }
+
+    fn retire_cuda(&mut self, gl: &glow::Context) {
         self.cuda_binding = None;
-        if let Some(textures) = self.cuda_textures.take()
-            && let Err(err) = textures.destroy(gl)
-        {
-            tracing::error!("CUDA texture cleanup failed: {err:#}");
-        }
-        if let Some(textures) = self.cuda_staging.take()
-            && let Err(err) = textures.destroy(gl)
-        {
-            tracing::error!("CUDA staging texture cleanup failed: {err:#}");
-        }
+        RETIRED_CUDA.with(|retired| {
+            let mut retired = retired.borrow_mut();
+            let active_failed = retire_owned(&mut self.cuda_textures, &mut retired, |textures| {
+                textures.destroy(gl)
+            });
+            let staging_failed = retire_owned(&mut self.cuda_staging, &mut retired, |textures| {
+                textures.destroy(gl)
+            });
+            if active_failed || staging_failed {
+                CUDA_CLEANUP_FAILED.store(true, std::sync::atomic::Ordering::Release);
+            }
+        });
     }
 
     fn clear_cpu_nv12(&mut self, gl: &glow::Context) {
@@ -1358,6 +1416,21 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_cleanup_retains_owner_for_retry() {
+        let mut owner = Some(7);
+        let mut retired = Vec::new();
+        assert!(retire_owned(&mut owner, &mut retired, |_| Err(
+            anyhow::anyhow!("context unavailable")
+        )));
+        assert_eq!(owner, None);
+        assert_eq!(retired, vec![7]);
+        let mut next = Some(9);
+        assert!(!retire_owned(&mut next, &mut retired, |_| Ok(())));
+        assert_eq!(next, None);
+        assert_eq!(retired, vec![7]);
+    }
 
     #[test]
     #[ignore = "requires an NVIDIA CUDA/GLES device, GStreamer nvcodec and ffmpeg"]

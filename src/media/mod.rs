@@ -3,7 +3,7 @@ pub mod static_img;
 pub mod video;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -230,7 +230,7 @@ pub fn decode_texture_async(key: TextureKey, sender: Sender<MediaEvent>) {
 #[derive(Debug)]
 pub struct WorkerControl {
     stop: AtomicBool,
-    paused: AtomicBool,
+    pause_state: AtomicU64,
     cuda_failed: AtomicBool,
     cv_lock: Mutex<()>,
     cv: Condvar,
@@ -241,7 +241,7 @@ impl WorkerControl {
     pub fn new(initially_paused: bool) -> Arc<Self> {
         Arc::new(Self {
             stop: AtomicBool::new(false),
-            paused: AtomicBool::new(initially_paused),
+            pause_state: AtomicU64::new(u64::from(initially_paused)),
             cuda_failed: AtomicBool::new(false),
             cv_lock: Mutex::new(()),
             cv: Condvar::new(),
@@ -263,7 +263,11 @@ impl WorkerControl {
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Acquire)
+        self.pause_state() & 1 != 0
+    }
+
+    fn pause_state(&self) -> u64 {
+        self.pause_state.load(Ordering::Acquire)
     }
 
     pub fn set_child_pid(&self, pid: i32) {
@@ -287,21 +291,29 @@ impl WorkerControl {
     }
 
     pub fn set_paused(&self, paused: bool) {
-        let prev = self.paused.swap(paused, Ordering::AcqRel);
-        if prev != paused {
-            self.cv.notify_all();
-            let pid = self.child_pid.load(Ordering::Acquire);
-            if pid > 0 {
-                let sig = if paused { libc::SIGSTOP } else { libc::SIGCONT };
-                unsafe {
-                    libc::kill(pid, sig);
-                }
+        let guard = self.cv_lock.lock().unwrap();
+        let state = self.pause_state();
+        if (state & 1 != 0) == paused {
+            return;
+        }
+        self.pause_state
+            .store(state.wrapping_add(1), Ordering::Release);
+        drop(guard);
+        self.cv.notify_all();
+        let pid = self.child_pid.load(Ordering::Acquire);
+        if pid > 0 {
+            let sig = if paused { libc::SIGSTOP } else { libc::SIGCONT };
+            unsafe {
+                libc::kill(pid, sig);
             }
         }
     }
 
     pub fn request_stop(&self) {
-        self.stop.store(true, Ordering::Release);
+        {
+            let _guard = self.cv_lock.lock().unwrap();
+            self.stop.store(true, Ordering::Release);
+        }
         self.cv.notify_all();
         let pid = self.child_pid.load(Ordering::Acquire);
         if pid > 0 {
@@ -330,6 +342,12 @@ impl WorkerControl {
             }
             let start = Instant::now();
             let guard = self.cv_lock.lock().unwrap();
+            if self.should_stop() {
+                return false;
+            }
+            if self.is_paused() {
+                continue;
+            }
             let (_g, _) = self.cv.wait_timeout(guard, remaining).unwrap();
             if self.should_stop() {
                 return false;
