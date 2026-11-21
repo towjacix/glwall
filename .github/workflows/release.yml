@@ -32,6 +32,7 @@ jobs:
             libegl-mesa0 \
             libgles2 \
             libgl1-mesa-dri \
+            ffmpeg \
             pkg-config \
             zstd
 
