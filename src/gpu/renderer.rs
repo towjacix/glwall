@@ -1412,7 +1412,7 @@ mod tests {
         let pool = TexturePool::new();
         let textures = BTreeMap::new();
         let uniforms = BTreeMap::new();
-        let params = DrawParams {
+        let mut params = DrawParams {
             width: 8,
             height: 8,
             time_secs: 0.0,
@@ -1451,6 +1451,68 @@ mod tests {
             bottom[2] > 150 && bottom[0] < 100,
             "expected blue bottom: {bottom:?}"
         );
+
+        let mut previous = MediaSlotGpu::empty();
+        previous
+            .set_rgba(
+                &renderer.gl,
+                8,
+                8,
+                FitMode::Stretch,
+                &[0, 255, 0, 255].repeat(64),
+            )
+            .unwrap();
+        let transition =
+            GlProgram::compile(&renderer.gl, crate::gpu::shader::BUILTIN_FADE).unwrap();
+        let postprocess = GlProgram::compile(&renderer.gl, BUILTIN_PASSTHROUGH).unwrap();
+        params.slot1 = Some(&previous);
+        params.transition_program = Some(&transition);
+        params.custom_program = Some(&postprocess);
+        params.in_transition = true;
+        params.progress = 0.0;
+        renderer.draw(&params, &pool).unwrap();
+        unsafe {
+            renderer.gl.read_pixels(
+                0,
+                0,
+                8,
+                8,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+        }
+        let old = &pixels[(4 * 8 + 4) * 4..(4 * 8 + 4) * 4 + 4];
+        assert!(
+            old[1] > 200 && old[0] < 20 && old[2] < 20,
+            "expected old green image: {old:?}"
+        );
+        params.progress = 1.0;
+        renderer.draw(&params, &pool).unwrap();
+        unsafe {
+            renderer.gl.read_pixels(
+                0,
+                0,
+                8,
+                8,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+        }
+        let top = &pixels[(6 * 8 + 4) * 4..(6 * 8 + 4) * 4 + 4];
+        let bottom = &pixels[(8 + 4) * 4..(8 + 4) * 4 + 4];
+        assert!(
+            top[0] > 150 && top[2] < 100,
+            "expected red top after transition: {top:?}"
+        );
+        assert!(
+            bottom[2] > 150 && bottom[0] < 100,
+            "expected blue bottom after transition: {bottom:?}"
+        );
+        previous.destroy(&renderer.gl);
+        transition.destroy(&renderer.gl);
+        postprocess.destroy(&renderer.gl);
         drop(decoder);
         slot.destroy(&renderer.gl);
         pool.destroy(&renderer.gl);
