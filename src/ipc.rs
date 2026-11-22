@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -244,9 +245,20 @@ pub enum DispatchOutcome {
     Deferred,
 }
 
+fn peer_hung_up(stream: &UnixStream) -> bool {
+    let mut pfd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLHUP | libc::POLLERR | libc::POLLRDHUP,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+    rc > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLERR)) != 0
+}
+
 pub struct ClientState {
     stream: UnixStream,
     token: Option<RegistrationToken>,
+    want_read: Arc<AtomicBool>,
     want_write: Arc<AtomicBool>,
     read_buf: Vec<u8>,
     write_buf: VecDeque<u8>,
@@ -257,10 +269,11 @@ pub struct ClientState {
 }
 
 impl ClientState {
-    fn new(stream: UnixStream, want_write: Arc<AtomicBool>) -> Self {
+    fn new(stream: UnixStream, want_read: Arc<AtomicBool>, want_write: Arc<AtomicBool>) -> Self {
         Self {
             stream,
             token: None,
+            want_read,
             want_write,
             read_buf: Vec::new(),
             write_buf: VecDeque::new(),
@@ -320,7 +333,17 @@ impl ClientState {
 pub struct IpcClientSource {
     pub id: IpcClientId,
     generic: Generic<UnixStream>,
+    want_read: Arc<AtomicBool>,
     want_write: Arc<AtomicBool>,
+}
+
+impl IpcClientSource {
+    fn desired_interest(&self) -> Interest {
+        Interest {
+            readable: self.want_read.load(Ordering::Acquire),
+            writable: self.want_write.load(Ordering::Acquire),
+        }
+    }
 }
 
 impl EventSource for IpcClientSource {
@@ -339,7 +362,6 @@ impl EventSource for IpcClientSource {
         F: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
     {
         let client_id = self.id;
-        let want_write = Arc::clone(&self.want_write);
         let action = self.generic.process_events(readiness, token, |r, _| {
             let action = callback((client_id, r), &mut ());
             Ok(action)
@@ -348,13 +370,11 @@ impl EventSource for IpcClientSource {
             return Ok(PostAction::Remove);
         }
 
-        let want_write = want_write.load(Ordering::Acquire);
-        if self.generic.interest.writable != want_write || !self.generic.interest.readable {
-            self.generic.interest = if want_write {
-                Interest::BOTH
-            } else {
-                Interest::READ
-            };
+        let desired = self.desired_interest();
+        if self.generic.interest.readable != desired.readable
+            || self.generic.interest.writable != desired.writable
+        {
+            self.generic.interest = desired;
             return Ok(PostAction::Reregister);
         }
         Ok(action)
@@ -373,12 +393,7 @@ impl EventSource for IpcClientSource {
         poll: &mut Poll,
         token_factory: &mut TokenFactory,
     ) -> calloop::Result<()> {
-        let desired = if self.want_write.load(Ordering::Acquire) {
-            Interest::BOTH
-        } else {
-            Interest::READ
-        };
-        self.generic.interest = desired;
+        self.generic.interest = self.desired_interest();
         self.generic.reregister(poll, token_factory)
     }
 
@@ -418,14 +433,16 @@ impl IpcHub {
         let id = IpcClientId(self.next_id);
         self.next_id += 1;
 
+        let want_read = Arc::new(AtomicBool::new(true));
         let want_write = Arc::new(AtomicBool::new(false));
         let source = IpcClientSource {
             id,
             generic: Generic::new(stream, Interest::READ, Mode::Level),
+            want_read: Arc::clone(&want_read),
             want_write: Arc::clone(&want_write),
         };
         self.clients
-            .insert(id, ClientState::new(cloned, want_write));
+            .insert(id, ClientState::new(cloned, want_read, want_write));
         Ok((id, source))
     }
 
@@ -465,11 +482,12 @@ impl IpcHub {
             .clients
             .iter()
             .filter_map(|(&id, client)| {
-                client
-                    .subscription
-                    .as_ref()
-                    .is_some_and(|sub| sub.matches(ev))
-                    .then_some(id)
+                (!client.closed
+                    && client
+                        .subscription
+                        .as_ref()
+                        .is_some_and(|sub| sub.matches(ev)))
+                .then_some(id)
             })
             .collect();
         if matching_ids.is_empty() {
@@ -490,12 +508,14 @@ impl IpcHub {
         };
         client.push_bytes(bytes);
         let closed = client.flush();
-        if !closed && !client.write_buf.is_empty() {
+        if !closed && !client.write_buf.is_empty() && !self.pending_reregister.contains(&id) {
             self.pending_reregister.push(id);
         }
         if client.should_remove() {
             client.closed = true;
-            self.pending_reregister.push(id);
+            if !self.pending_reregister.contains(&id) {
+                self.pending_reregister.push(id);
+            }
         }
     }
 
@@ -530,7 +550,7 @@ impl IpcHub {
             return (Vec::new(), true);
         }
 
-        if readiness.readable {
+        if readiness.readable && client.want_read.load(Ordering::Acquire) {
             let mut tmp = [0u8; 4096];
             loop {
                 match (&client.stream).read(&mut tmp) {
@@ -591,6 +611,17 @@ impl IpcHub {
                         client.push_bytes(&payload);
                     }
                 }
+            }
+        }
+
+        // calloop 0.14 hardcodes `readiness.error = false`, so distinguish a full peer close
+        // (POLLHUP/POLLERR -> drop immediately even for subscribers/waiters) from a write-side
+        // half-close (disarm read interest so level-triggered epoll stops spinning until HUP).
+        if client.read_eof || (!readiness.readable && !readiness.writable) {
+            if peer_hung_up(&client.stream) {
+                client.closed = true;
+            } else if client.read_eof {
+                client.want_read.store(false, Ordering::Release);
             }
         }
 
@@ -1006,5 +1037,225 @@ mod tests {
             .dispatch(Some(Duration::from_millis(25)), &mut state)
             .unwrap();
         assert_eq!(state.callbacks, count_after_remove);
+    }
+
+    #[test]
+    fn ipc_subscriber_removes_immediately_on_disconnect_without_spinning() {
+        struct LoopState {
+            hub: IpcHub,
+            callbacks: usize,
+            removed: bool,
+        }
+
+        let (server_sock, mut client_sock) = UnixStream::pair().unwrap();
+        client_sock.set_nonblocking(false).unwrap();
+
+        let mut event_loop: calloop::EventLoop<'static, LoopState> =
+            calloop::EventLoop::try_new().unwrap();
+        let handle = event_loop.handle();
+        let mut state = LoopState {
+            hub: IpcHub::new(),
+            callbacks: 0,
+            removed: false,
+        };
+
+        let (client_id, source) = state.hub.accept_stream(server_sock).unwrap();
+        let token = handle
+            .insert_source(source, |(id, readiness), _, s: &mut LoopState| {
+                s.callbacks += 1;
+                let (lines, mut remove) = s.hub.poll_client_lines(id, readiness);
+                for line in lines {
+                    remove = remove || s.hub.handle_raw_line(id, &line, |_, _| unreachable!());
+                }
+                if remove {
+                    s.hub.remove_client(id);
+                    s.removed = true;
+                    PostAction::Remove
+                } else {
+                    PostAction::Continue
+                }
+            })
+            .unwrap();
+        state.hub.set_client_token(client_id, token);
+
+        client_sock.write_all(b"{\"op\":\"subscribe\"}\n").unwrap();
+        event_loop
+            .dispatch(Some(Duration::from_millis(200)), &mut state)
+            .unwrap();
+
+        let mut ack_line = String::new();
+        BufReader::new(&client_sock)
+            .read_line(&mut ack_line)
+            .unwrap();
+        assert!(
+            serde_json::from_str::<IpcResponse>(ack_line.trim_end())
+                .unwrap()
+                .ok
+        );
+        assert!(!state.removed);
+
+        drop(client_sock);
+        for _ in 0..3 {
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut state)
+                .unwrap();
+            if state.removed {
+                break;
+            }
+        }
+        assert!(state.removed);
+        assert!(state.hub.clients.is_empty());
+
+        let count_after_remove = state.callbacks;
+        event_loop
+            .dispatch(Some(Duration::from_millis(25)), &mut state)
+            .unwrap();
+        assert_eq!(state.callbacks, count_after_remove);
+    }
+
+    #[test]
+    fn ipc_half_closed_waiter_does_not_spin_and_removes_on_full_close() {
+        struct LoopState {
+            hub: IpcHub,
+            callbacks: usize,
+            removed: bool,
+        }
+
+        let (server_sock, mut client_sock) = UnixStream::pair().unwrap();
+        client_sock.set_nonblocking(false).unwrap();
+
+        let mut event_loop: calloop::EventLoop<'static, LoopState> =
+            calloop::EventLoop::try_new().unwrap();
+        let handle = event_loop.handle();
+        let mut state = LoopState {
+            hub: IpcHub::new(),
+            callbacks: 0,
+            removed: false,
+        };
+
+        let (client_id, source) = state.hub.accept_stream(server_sock).unwrap();
+        let token = handle
+            .insert_source(source, |(id, readiness), _, s: &mut LoopState| {
+                s.callbacks += 1;
+                let (lines, mut remove) = s.hub.poll_client_lines(id, readiness);
+                for line in lines {
+                    let mut deferred = false;
+                    let early_remove = s.hub.handle_raw_line(id, &line, |_, _| {
+                        deferred = true;
+                        DispatchOutcome::Deferred
+                    });
+                    if deferred {
+                        s.hub.retain_pending_ack(id);
+                    } else if early_remove {
+                        remove = true;
+                    }
+                }
+                if remove {
+                    s.hub.remove_client(id);
+                    s.removed = true;
+                    PostAction::Remove
+                } else {
+                    PostAction::Continue
+                }
+            })
+            .unwrap();
+        state.hub.set_client_token(client_id, token);
+
+        client_sock.write_all(b"{\"op\":\"status\"}\n").unwrap();
+        client_sock.shutdown(std::net::Shutdown::Write).unwrap();
+
+        for _ in 0..4 {
+            event_loop
+                .dispatch(Some(Duration::from_millis(10)), &mut state)
+                .unwrap();
+        }
+        assert!(!state.removed);
+        let settled_callbacks = state.callbacks;
+        assert!(
+            settled_callbacks <= 3,
+            "half-closed waiter spun on EOF: {settled_callbacks} callbacks"
+        );
+
+        // Must not spin once read interest is cleared while awaiting deferred ack.
+        for _ in 0..3 {
+            event_loop
+                .dispatch(Some(Duration::from_millis(10)), &mut state)
+                .unwrap();
+        }
+        assert_eq!(state.callbacks, settled_callbacks);
+
+        // Closing the read half too must wake EPOLLHUP and remove the abandoned waiter.
+        drop(client_sock);
+        for _ in 0..3 {
+            event_loop
+                .dispatch(Some(Duration::from_millis(20)), &mut state)
+                .unwrap();
+            if state.removed {
+                break;
+            }
+        }
+        assert!(state.removed);
+        assert!(state.hub.clients.is_empty());
+    }
+
+    #[test]
+    fn ipc_broadcast_skips_closed_clients_and_deduplicates_reregisters() {
+        let event_loop: calloop::EventLoop<'static, ()> = calloop::EventLoop::try_new().unwrap();
+        let handle = event_loop.handle();
+
+        let (server_a, _cli_a) = UnixStream::pair().unwrap();
+        let (server_b, _cli_b) = UnixStream::pair().unwrap();
+
+        let mut hub = IpcHub::new();
+        let (id_a, src_a) = hub.accept_stream(server_a).unwrap();
+        let (id_b, src_b) = hub.accept_stream(server_b).unwrap();
+        let tok_a = handle
+            .insert_source(src_a, |_, _, _| PostAction::Continue)
+            .unwrap();
+        let tok_b = handle
+            .insert_source(src_b, |_, _, _| PostAction::Continue)
+            .unwrap();
+        hub.set_client_token(id_a, tok_a);
+        hub.set_client_token(id_b, tok_b);
+
+        let filter = SubscriptionFilter {
+            output: None,
+            events: Vec::new(),
+        };
+        if let Some(a) = hub.clients.get_mut(&id_a) {
+            a.subscription = Some(filter.clone());
+            a.closed = true;
+        }
+        if let Some(b) = hub.clients.get_mut(&id_b) {
+            b.subscription = Some(filter);
+        }
+
+        // Send a 64 KiB event while peer doesn't drain, or push directly to enqueue_and_flush twice
+        // while keeping read_eof true on id_b so should_remove is triggered / buffer stays non-empty.
+        let large_msg = "x".repeat(400_000);
+        let ev = IpcEvent::MediaError {
+            output: "DP-1".into(),
+            message: large_msg,
+        };
+        hub.broadcast_event(&ev);
+        hub.broadcast_event(&ev);
+        // Closed client id_a must never receive broadcasts.
+        assert!(hub.clients[&id_a].write_buf.is_empty());
+
+        // Exercise deduplication of pending_reregister explicitly when queue retains bytes.
+        let (server_c, cli_c) = UnixStream::pair().unwrap();
+        let (id_c, src_c) = hub.accept_stream(server_c).unwrap();
+        let tok_c = handle
+            .insert_source(src_c, |_, _, _| PostAction::Continue)
+            .unwrap();
+        hub.set_client_token(id_c, tok_c);
+        if let Some(c) = hub.clients.get_mut(&id_c) {
+            c.read_eof = true;
+        }
+        hub.enqueue_and_flush(id_c, b"{\"ok\":true}\n");
+        hub.enqueue_and_flush(id_c, b"{\"ok\":true}\n");
+        let drained = hub.drain_pending_reregisters();
+        assert_eq!(drained.iter().filter(|(id, _, _)| *id == id_c).count(), 1);
+        drop(cli_c);
     }
 }
