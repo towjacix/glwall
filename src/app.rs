@@ -16,24 +16,83 @@ use smithay_client_toolkit::shell::WaylandSurface;
 use wayland_client::Proxy;
 use wayland_client::protocol::{wl_output, wl_surface};
 
-use crate::config::{Config, OutputSpec, PersistedState, default_state_path};
+use crate::config::{Config, FitMode, HwAccel, OutputSpec, PersistedState, default_state_path};
 use crate::gpu::egl::EglState;
 use crate::gpu::renderer::{
-    DrawParams, GlProgram, MediaSlotGpu, Renderer, SlotMediaKind, TextureId, TextureKey,
-    TexturePool,
+    DrawParams, GlProgram, MediaSlotGpu, Renderer, SlotMediaKind, TextureFingerprint, TextureId,
+    TextureKey, TexturePool,
 };
 use crate::gpu::shader::resolve_transition_source;
 use crate::gpu::uniforms::{TextureSpec, UniformValue};
 use crate::ipc::{
-    ApplyMedia, ApplyTransition, DispatchOutcome, IpcClientId, IpcEvent, IpcHub, IpcRequest,
-    IpcResponse, bind_ipc_listener,
+    ApplyMedia, ApplyTransition, BatchOutputApply, DispatchOutcome, IpcClientId, IpcErrorCode,
+    IpcEvent, IpcHub, IpcRequest, IpcResponse, bind_ipc_listener, coded_err, error_code_of,
 };
-use crate::media::{FramePayload, MediaEvent, MediaJob, MediaKind, decode_texture_async};
+use crate::media::gst_cuda::active_pipeline_count;
+use crate::media::static_img::check_image_limits;
+use crate::media::{
+    FramePayload, MediaEvent, MediaJob, MediaKind, active_media_workers, aux_decode_has_capacity,
+    aux_decode_stats, decode_texture_async,
+};
 use crate::pause::PauseState;
 use crate::watcher::{ShaderWatcher, absolutize_path};
 use crate::wayland::{SurfaceHandle, WaylandAppSink, WaylandContext, WaylandHandles};
 
 const WAIT_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Default)]
+struct TransientUniformState {
+    session: String,
+    last_seq: u64,
+    pending_overlay: Option<BTreeMap<String, UniformValue>>,
+    active_overlay: BTreeMap<String, UniformValue>,
+}
+
+impl TransientUniformState {
+    fn clear(&mut self) -> bool {
+        let had_any = !self.active_overlay.is_empty() || self.pending_overlay.is_some();
+        self.session.clear();
+        self.last_seq = 0;
+        self.pending_overlay = None;
+        self.active_overlay.clear();
+        had_any
+    }
+
+    fn prune(&mut self, allowed_uniforms: &HashSet<String>) {
+        if let Some(ref mut pending) = self.pending_overlay {
+            pending.retain(|k, _| allowed_uniforms.contains(k.as_str()));
+            if pending.is_empty() {
+                self.pending_overlay = None;
+            }
+        }
+        self.active_overlay
+            .retain(|k, _| allowed_uniforms.contains(k.as_str()));
+    }
+
+    /// Promotes any staged 1-slot overlay into `active_overlay` right before drawing.
+    fn consume_pending(&mut self) {
+        if let Some(next) = self.pending_overlay.take() {
+            self.active_overlay = next;
+        }
+    }
+
+    fn current_overlay(&self) -> &BTreeMap<String, UniformValue> {
+        self.pending_overlay
+            .as_ref()
+            .unwrap_or(&self.active_overlay)
+    }
+}
+
+fn effective_uniforms_with_overlay(
+    base: &BTreeMap<String, UniformValue>,
+    overlay: &BTreeMap<String, UniformValue>,
+) -> BTreeMap<String, UniformValue> {
+    let mut merged = base.clone();
+    for (k, v) in overlay {
+        merged.insert(k.clone(), v.clone());
+    }
+    merged
+}
 
 struct OutputEntry {
     index: i32,
@@ -44,6 +103,13 @@ struct OutputEntry {
     spec: OutputSpec,
     revision: u64,
     generation: u64,
+    active_generation: u64,
+    pending_generation: Option<u64>,
+    last_committed_frame: Option<i32>,
+    last_committed_revision: u64,
+    target_sig: Option<(u64, i64, i64)>,
+    shader_sig: Option<(u64, i64, i64)>,
+    last_transition: (String, u32),
     slot0: MediaSlotGpu,
     slot1: Option<MediaSlotGpu>,
     slot0_has_first_frame: bool,
@@ -52,7 +118,9 @@ struct OutputEntry {
     custom_program: Option<GlProgram>,
     custom_shader_path: Option<PathBuf>,
     custom_textures: BTreeMap<String, TextureId>,
+    custom_texture_keys: BTreeMap<String, TextureKey>,
     custom_uniforms: BTreeMap<String, UniformValue>,
+    transient: TransientUniformState,
     last_shader_error: Option<String>,
     last_media_error: Option<String>,
     transition_program: Option<GlProgram>,
@@ -123,8 +191,13 @@ enum StagedShader {
 
 struct PendingApply {
     revision: u64,
+    group_id: Option<String>,
     persist: bool,
     shader: StagedShader,
+    target_sig: Option<(u64, i64, i64)>,
+    shader_sig: Option<(u64, i64, i64)>,
+    applied_transition: Option<(String, u32)>,
+    clear_transient: bool,
     texture_updates: BTreeMap<String, Option<(TextureSpec, TextureKey)>>,
     acquired_textures: HashMap<TextureKey, TextureId>,
     pending_keys: HashSet<TextureKey>,
@@ -147,6 +220,166 @@ impl PendingApply {
     }
 }
 
+impl OutputEntry {
+    fn media_kind_label(&self) -> &'static str {
+        if let Some(ref job) = self.job {
+            return match job.kind {
+                MediaKind::ProceduralShader => "shader",
+                MediaKind::StaticImage | MediaKind::FfmpegStaticImage => "image",
+                MediaKind::AnimatedGif | MediaKind::AnimatedWebp => "animated_image",
+                MediaKind::Video => "video",
+            };
+        }
+        match self.slot0.kind {
+            SlotMediaKind::None => {
+                if self.custom_program.is_some()
+                    || self
+                        .spec
+                        .target
+                        .as_deref()
+                        .and_then(|t| MediaKind::from_path(Path::new(t)))
+                        == Some(MediaKind::ProceduralShader)
+                {
+                    "shader"
+                } else {
+                    "none"
+                }
+            }
+            SlotMediaKind::Rgba => {
+                match self
+                    .spec
+                    .target
+                    .as_deref()
+                    .and_then(|t| MediaKind::from_path(Path::new(t)))
+                {
+                    Some(MediaKind::AnimatedGif | MediaKind::AnimatedWebp) => "animated_image",
+                    _ => "image",
+                }
+            }
+            SlotMediaKind::Nv12 => "video",
+        }
+    }
+
+    fn decoder_status(&self, paused: bool) -> &'static str {
+        if self.pending_apply.is_some() {
+            "staging"
+        } else if self.last_media_error.is_some() && self.job.is_none() {
+            "error"
+        } else if self.waiting_target_frame || self.in_transition {
+            "transitioning"
+        } else if self.job.is_some() {
+            if paused { "paused" } else { "decoding" }
+        } else if self.slot0.kind != SlotMediaKind::None || self.custom_program.is_some() {
+            "ready"
+        } else {
+            "idle"
+        }
+    }
+
+    fn estimated_gpu_bytes(&self, renderer: Option<&Renderer>) -> u64 {
+        let s0 = self.slot0.estimated_gpu_bytes();
+        let s1 = self.slot1.as_ref().map_or(0, |s| s.estimated_gpu_bytes());
+        let res = renderer.map_or(0, |r| r.resolve_target_gpu_bytes(&self.name));
+        s0 + s1 + res
+    }
+}
+
+fn read_self_memory_stats() -> (u64, u64, u64) {
+    let Ok(text) = fs::read_to_string("/proc/self/smaps_rollup") else {
+        return (0, 0, 0);
+    };
+    let mut rss = 0u64;
+    let mut pss = 0u64;
+    let mut private_dirty = 0u64;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let Some(val_str) = parts.next() else {
+            continue;
+        };
+        let Ok(val) = val_str.parse::<u64>() else {
+            continue;
+        };
+        match key {
+            "Rss:" => rss = val,
+            "Pss:" => pss = val,
+            "Private_Dirty:" => private_dirty = val,
+            _ => {}
+        }
+    }
+    (rss, pss, private_dirty)
+}
+
+fn file_stat_sig(path: &Path) -> Option<(u64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.len(), meta.mtime(), meta.mtime_nsec()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UniformFingerprint {
+    Bool(bool),
+    Int(i32),
+    Float(u32),
+    Vec2([u32; 2]),
+    Vec3([u32; 3]),
+    Vec4([u32; 4]),
+}
+
+fn norm_f32_bits(v: f32) -> u32 {
+    if v == 0.0 {
+        0.0f32.to_bits()
+    } else {
+        v.to_bits()
+    }
+}
+
+impl From<&UniformValue> for UniformFingerprint {
+    fn from(v: &UniformValue) -> Self {
+        match v {
+            UniformValue::Bool(b) => Self::Bool(*b),
+            UniformValue::Int(i) => Self::Int(*i),
+            UniformValue::Float(f) => Self::Float(norm_f32_bits(*f)),
+            UniformValue::Vec2([a, b]) => Self::Vec2([norm_f32_bits(*a), norm_f32_bits(*b)]),
+            UniformValue::Vec3([a, b, c]) => {
+                Self::Vec3([norm_f32_bits(*a), norm_f32_bits(*b), norm_f32_bits(*c)])
+            }
+            UniformValue::Vec4([a, b, c, d]) => Self::Vec4([
+                norm_f32_bits(*a),
+                norm_f32_bits(*b),
+                norm_f32_bits(*c),
+                norm_f32_bits(*d),
+            ]),
+        }
+    }
+}
+
+type TexFpEntry = (
+    PathBuf,
+    crate::gpu::uniforms::TextureFilter,
+    crate::gpu::uniforms::TextureWrap,
+    bool,
+    TextureFingerprint,
+);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveSpecFingerprint {
+    target: Option<String>,
+    target_sig: Option<(u64, i64, i64)>,
+    fit: FitMode,
+    fps_bits: Option<u32>,
+    hwaccel: HwAccel,
+    shader: Option<String>,
+    shader_sig: Option<(u64, i64, i64)>,
+    transition: String,
+    duration_ms: u32,
+    params_bits: [u32; 4],
+    textures: BTreeMap<String, TexFpEntry>,
+    uniforms: BTreeMap<String, UniformFingerprint>,
+}
+
 fn frame_needs_render(
     configured: bool,
     frame_pending: bool,
@@ -157,8 +390,10 @@ fn frame_needs_render(
     configured && !frame_pending && !apply_pending && (dirty || continuous)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prune_shader_bindings(
     custom_textures: &mut BTreeMap<String, TextureId>,
+    custom_texture_keys: &mut BTreeMap<String, TextureKey>,
     spec_textures: &mut BTreeMap<String, TextureSpec>,
     custom_uniforms: &mut BTreeMap<String, UniformValue>,
     spec_uniforms: &mut BTreeMap<String, UniformValue>,
@@ -175,8 +410,10 @@ fn prune_shader_bindings(
         if let Some(id) = custom_textures.remove(&key) {
             removed_ids.push(id);
         }
+        custom_texture_keys.remove(&key);
         spec_textures.remove(&key);
     }
+    custom_texture_keys.retain(|k, _| allowed_samplers.contains(k.as_str()));
     spec_textures.retain(|k, _| allowed_samplers.contains(k.as_str()));
     custom_uniforms.retain(|k, _| allowed_uniforms.contains(k.as_str()));
     spec_uniforms.retain(|k, _| allowed_uniforms.contains(k.as_str()));
@@ -189,6 +426,7 @@ fn apply_program_and_prune(
     new_prog: GlProgram,
     custom_program: &mut Option<GlProgram>,
     custom_textures: &mut BTreeMap<String, TextureId>,
+    custom_texture_keys: &mut BTreeMap<String, TextureKey>,
     spec_textures: &mut BTreeMap<String, TextureSpec>,
     custom_uniforms: &mut BTreeMap<String, UniformValue>,
     spec_uniforms: &mut BTreeMap<String, UniformValue>,
@@ -209,6 +447,7 @@ fn apply_program_and_prune(
     }
     let removed = prune_shader_bindings(
         custom_textures,
+        custom_texture_keys,
         spec_textures,
         custom_uniforms,
         spec_uniforms,
@@ -226,17 +465,20 @@ fn reload_shader_into_bindings(
     src: &str,
     custom_program: &mut Option<GlProgram>,
     custom_textures: &mut BTreeMap<String, TextureId>,
+    custom_texture_keys: &mut BTreeMap<String, TextureKey>,
     spec_textures: &mut BTreeMap<String, TextureSpec>,
     custom_uniforms: &mut BTreeMap<String, UniformValue>,
     spec_uniforms: &mut BTreeMap<String, UniformValue>,
     texture_pool: &mut TexturePool,
 ) -> Result<()> {
-    let new_prog = GlProgram::compile(gl, src)?;
+    let new_prog = GlProgram::compile(gl, src)
+        .map_err(|e| coded_err(IpcErrorCode::ShaderCompile, format!("{e:#}")))?;
     apply_program_and_prune(
         gl,
         new_prog,
         custom_program,
         custom_textures,
+        custom_texture_keys,
         spec_textures,
         custom_uniforms,
         spec_uniforms,
@@ -247,6 +489,7 @@ fn reload_shader_into_bindings(
 
 struct CommitWaiter {
     client_id: IpcClientId,
+    group_id: Option<String>,
     revision_targets: Vec<(String, u64)>,
     completed: HashSet<String>,
     max_revision: u64,
@@ -256,9 +499,13 @@ struct CommitWaiter {
 struct PreparedTransaction {
     next_revision: u64,
     shader: StagedShader,
+    target_sig: Option<(u64, i64, i64)>,
+    shader_sig: Option<(u64, i64, i64)>,
     resolved_media: Option<(PathBuf, MediaKind, ApplyMedia)>,
     spawned_job: Option<MediaJob>,
     transition_spec: Option<(String, u32)>,
+    applied_transition: Option<(String, u32)>,
+    clear_transient: bool,
     transition_prog: Option<GlProgram>,
     texture_updates: BTreeMap<String, Option<(TextureSpec, TextureKey)>>,
     uniform_updates: BTreeMap<String, UniformValue>,
@@ -282,7 +529,7 @@ impl PreparedTransaction {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct TxParams {
     output: String,
     revision: Option<u64>,
@@ -468,16 +715,285 @@ enum ShaderRequest {
 struct ResolvedPreflightInputs {
     next_revision: u64,
     resolved_media: Option<(PathBuf, MediaKind, ApplyMedia)>,
+    target_sig: Option<(u64, i64, i64)>,
+    shader_sig: Option<(u64, i64, i64)>,
     shader_request: ShaderRequest,
     clear_implicit_shader: bool,
     transition_spec: Option<(String, u32)>,
     transition_source: Option<String>,
     normalized_textures: BTreeMap<String, Option<(TextureSpec, TextureKey)>>,
+    estimated_media_bytes: u64,
+    estimated_aux_bytes: HashMap<TextureKey, u64>,
 }
 
 impl ResolvedPreflightInputs {
     fn needs_gl(&self) -> bool {
         matches!(self.shader_request, ShaderRequest::Set { .. }) || self.transition_source.is_some()
+    }
+}
+
+fn map_transition_source_err(err: anyhow::Error) -> anyhow::Error {
+    if err
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == ErrorKind::NotFound)
+    {
+        coded_err(IpcErrorCode::MissingSource, format!("{err:#}"))
+    } else {
+        coded_err(IpcErrorCode::InvalidInput, format!("{err:#}"))
+    }
+}
+
+fn texture_spec_fp_entry(spec: &TextureSpec, key: &TextureKey) -> TexFpEntry {
+    let canonical_path = std::fs::canonicalize(&spec.path).unwrap_or_else(|_| spec.path.clone());
+    (
+        canonical_path,
+        spec.filter,
+        spec.wrap,
+        spec.flip_y,
+        key.fingerprint,
+    )
+}
+
+fn fingerprint_from_output_entry(entry: &OutputEntry) -> (EffectiveSpecFingerprint, bool) {
+    if let Some(ref pending) = entry.pending_apply {
+        let target = normalize_optional_path(
+            pending
+                .target_override
+                .as_deref()
+                .or(entry.spec.target.as_deref()),
+        );
+        let target_sig = if pending.target_override.is_some() {
+            pending.target_sig
+        } else {
+            entry.target_sig
+        };
+        let (shader, shader_sig) = match &pending.shader {
+            StagedShader::Keep => (
+                normalize_optional_path(entry.spec.shader.as_deref()),
+                entry.shader_sig,
+            ),
+            StagedShader::Clear => (None, None),
+            StagedShader::Set { path, .. } => (
+                normalize_optional_path(Some(&path.to_string_lossy())),
+                pending.shader_sig,
+            ),
+        };
+        let (transition, duration_ms) = pending
+            .applied_transition
+            .clone()
+            .unwrap_or_else(|| entry.last_transition.clone());
+        let params_bits = pending
+            .params_update
+            .unwrap_or(entry.spec.params)
+            .map(norm_f32_bits);
+
+        let mut textures: BTreeMap<String, TexFpEntry> = entry
+            .spec
+            .textures
+            .iter()
+            .map(|(k, spec)| {
+                let key = entry
+                    .custom_texture_keys
+                    .get(k)
+                    .cloned()
+                    .unwrap_or_else(|| TextureKey::from_spec(spec));
+                (k.clone(), texture_spec_fp_entry(spec, &key))
+            })
+            .collect();
+        let mut uniforms: BTreeMap<String, UniformFingerprint> = entry
+            .custom_uniforms
+            .iter()
+            .map(|(k, v)| (k.clone(), UniformFingerprint::from(v)))
+            .collect();
+
+        match &pending.shader {
+            StagedShader::Keep => {}
+            StagedShader::Clear => {
+                textures.clear();
+                uniforms.clear();
+            }
+            StagedShader::Set { program, .. } => {
+                let allowed_s: HashSet<&str> = program
+                    .user_samplers
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect();
+                let allowed_u: HashSet<&str> = program
+                    .user_uniforms
+                    .iter()
+                    .map(|u| u.name.as_str())
+                    .collect();
+                textures.retain(|k, _| allowed_s.contains(k.as_str()));
+                uniforms.retain(|k, _| allowed_u.contains(k.as_str()));
+            }
+        }
+        for (k, opt) in &pending.texture_updates {
+            match opt {
+                Some((spec, key)) => {
+                    textures.insert(k.clone(), texture_spec_fp_entry(spec, key));
+                }
+                None => {
+                    textures.remove(k);
+                }
+            }
+        }
+        for (k, v) in &pending.uniform_updates {
+            uniforms.insert(k.clone(), UniformFingerprint::from(v));
+        }
+
+        let fp = EffectiveSpecFingerprint {
+            target,
+            target_sig,
+            fit: entry.spec.fit,
+            fps_bits: entry.spec.fps.map(norm_f32_bits),
+            hwaccel: entry.spec.hwaccel,
+            shader,
+            shader_sig,
+            transition,
+            duration_ms,
+            params_bits,
+            textures,
+            uniforms,
+        };
+        return (fp, true);
+    }
+
+    let target = normalize_optional_path(entry.spec.target.as_deref());
+    let shader = normalize_optional_path(entry.spec.shader.as_deref());
+    let is_procedural = target
+        .as_deref()
+        .and_then(|t| MediaKind::from_path(Path::new(t)))
+        == Some(MediaKind::ProceduralShader);
+    let media_ok = if target.is_some() {
+        if is_procedural {
+            entry.custom_program.is_some()
+        } else {
+            entry.slot0.kind != SlotMediaKind::None || entry.job.is_some()
+        }
+    } else {
+        true
+    };
+    let shader_ok = shader.is_none() || entry.custom_program.is_some();
+    let tex_ok = entry
+        .spec
+        .textures
+        .iter()
+        .all(|(k, _)| entry.custom_textures.contains_key(k));
+
+    let textures = entry
+        .spec
+        .textures
+        .iter()
+        .map(|(k, spec)| {
+            let key = entry
+                .custom_texture_keys
+                .get(k)
+                .cloned()
+                .unwrap_or_else(|| TextureKey::from_spec(spec));
+            (k.clone(), texture_spec_fp_entry(spec, &key))
+        })
+        .collect();
+    let uniforms = entry
+        .custom_uniforms
+        .iter()
+        .map(|(k, v)| (k.clone(), UniformFingerprint::from(v)))
+        .collect();
+
+    let fp = EffectiveSpecFingerprint {
+        target,
+        target_sig: entry.target_sig,
+        fit: entry.spec.fit,
+        fps_bits: entry.spec.fps.map(norm_f32_bits),
+        hwaccel: entry.spec.hwaccel,
+        shader,
+        shader_sig: entry.shader_sig,
+        transition: entry.last_transition.0.clone(),
+        duration_ms: entry.last_transition.1,
+        params_bits: entry.spec.params.map(norm_f32_bits),
+        textures,
+        uniforms,
+    };
+    (fp, media_ok && shader_ok && tex_ok)
+}
+
+fn fingerprint_for_tx(
+    tx: &TxParams,
+    pre: &ResolvedPreflightInputs,
+    current: &EffectiveSpecFingerprint,
+) -> EffectiveSpecFingerprint {
+    let (target, target_sig) = if let Some(ref media) = tx.media {
+        (normalize_optional_path(Some(&media.target)), pre.target_sig)
+    } else {
+        (current.target.clone(), current.target_sig)
+    };
+    let fit = tx.media.as_ref().and_then(|m| m.fit).unwrap_or(current.fit);
+    let fps_bits = tx
+        .media
+        .as_ref()
+        .and_then(|m| m.fps)
+        .map(norm_f32_bits)
+        .or(current.fps_bits);
+    let hwaccel = tx
+        .media
+        .as_ref()
+        .and_then(|m| m.hwaccel)
+        .unwrap_or(current.hwaccel);
+
+    let (shader, shader_sig) = match &pre.shader_request {
+        ShaderRequest::Keep => (current.shader.clone(), current.shader_sig),
+        ShaderRequest::Clear => (None, None),
+        ShaderRequest::Set { path, .. } => (
+            normalize_optional_path(Some(&path.to_string_lossy())),
+            pre.shader_sig,
+        ),
+    };
+
+    let (transition, duration_ms) = pre
+        .transition_spec
+        .clone()
+        .unwrap_or_else(|| (current.transition.clone(), current.duration_ms));
+    let params_bits = tx
+        .params
+        .map(|p| p.map(norm_f32_bits))
+        .unwrap_or(current.params_bits);
+
+    let mut textures = if matches!(pre.shader_request, ShaderRequest::Clear) {
+        BTreeMap::new()
+    } else {
+        current.textures.clone()
+    };
+    let mut uniforms = if matches!(pre.shader_request, ShaderRequest::Clear) {
+        BTreeMap::new()
+    } else {
+        current.uniforms.clone()
+    };
+    for (k, opt) in &pre.normalized_textures {
+        match opt {
+            Some((spec, key)) => {
+                textures.insert(k.clone(), texture_spec_fp_entry(spec, key));
+            }
+            None => {
+                textures.remove(k);
+            }
+        }
+    }
+    for (k, v) in &tx.uniforms {
+        uniforms.insert(k.clone(), UniformFingerprint::from(v));
+    }
+
+    EffectiveSpecFingerprint {
+        target,
+        target_sig,
+        fit,
+        fps_bits,
+        hwaccel,
+        shader,
+        shader_sig,
+        transition,
+        duration_ms,
+        params_bits,
+        textures,
+        uniforms,
     }
 }
 
@@ -487,32 +1003,75 @@ fn resolve_preflight_inputs(
     entry_revision: u64,
     entry_spec: &OutputSpec,
     slot0_present: bool,
+    effective_max_dim: u32,
+    max_image_pixels: u64,
 ) -> Result<ResolvedPreflightInputs> {
     let next_revision = match tx.revision {
         Some(r) => {
             if r < entry_revision {
-                bail!("non-monotonic revision {r} < {entry_revision} on {output_name}");
+                return Err(coded_err(
+                    IpcErrorCode::RevisionConflict,
+                    format!("non-monotonic revision {r} < {entry_revision} on {output_name}"),
+                ));
             }
             r
         }
         None => entry_revision + 1,
     };
 
+    if let Some(params) = tx.params
+        && !params.iter().all(|v| v.is_finite())
+    {
+        return Err(coded_err(
+            IpcErrorCode::InvalidInput,
+            "params contain non-finite float value",
+        ));
+    }
+
     let mut resolved_media = None;
+    let mut target_sig = None;
+    let mut shader_sig = None;
     let mut shader_mode_request = tx.shader.clone();
     let mut clear_implicit_shader = false;
+    let mut estimated_media_bytes = 0u64;
 
     if let Some(ref media) = tx.media {
-        let path = absolutize_path(Path::new(&media.target));
-        let kind = MediaKind::from_path(&path).ok_or_else(|| {
-            anyhow::anyhow!("unsupported wallpaper file type: {}", path.display())
-        })?;
-        if !path.is_file() {
-            bail!("wallpaper file does not exist: {}", path.display());
+        let trimmed = media.target.trim();
+        if trimmed.is_empty() {
+            return Err(coded_err(
+                IpcErrorCode::InvalidInput,
+                "media target path cannot be empty",
+            ));
         }
+        let path = absolutize_path(Path::new(trimmed));
+        if !path.is_file() {
+            return Err(coded_err(
+                IpcErrorCode::MissingSource,
+                format!("wallpaper file does not exist: {}", path.display()),
+            ));
+        }
+        let kind = MediaKind::from_path(&path).ok_or_else(|| {
+            coded_err(
+                IpcErrorCode::UnsupportedMedia,
+                format!("unsupported wallpaper file type: {}", path.display()),
+            )
+        })?;
+        target_sig = file_stat_sig(&path);
         if kind == MediaKind::ProceduralShader {
             shader_mode_request = Some(path.to_string_lossy().to_string());
         } else {
+            if matches!(
+                kind,
+                MediaKind::StaticImage
+                    | MediaKind::FfmpegStaticImage
+                    | MediaKind::AnimatedGif
+                    | MediaKind::AnimatedWebp
+            ) {
+                let (mw, mh) = check_image_limits(&path, effective_max_dim, max_image_pixels)?;
+                estimated_media_bytes = u64::from(mw)
+                    .saturating_mul(u64::from(mh))
+                    .saturating_mul(4);
+            }
             if shader_mode_request.is_none()
                 && entry_spec
                     .target
@@ -532,8 +1091,23 @@ fn resolve_preflight_inputs(
             ShaderRequest::Clear
         } else {
             let resolved_sh = absolutize_path(Path::new(trimmed));
-            let source = fs::read_to_string(&resolved_sh)
-                .with_context(|| format!("failed to read shader {}", resolved_sh.display()))?;
+            if !resolved_sh.is_file() {
+                return Err(coded_err(
+                    IpcErrorCode::MissingSource,
+                    format!("shader file does not exist: {}", resolved_sh.display()),
+                ));
+            }
+            let source = fs::read_to_string(&resolved_sh).map_err(|e| {
+                coded_err(
+                    if e.kind() == ErrorKind::NotFound {
+                        IpcErrorCode::MissingSource
+                    } else {
+                        IpcErrorCode::InvalidInput
+                    },
+                    format!("failed to read shader {}: {e}", resolved_sh.display()),
+                )
+            })?;
+            shader_sig = file_stat_sig(&resolved_sh);
             ShaderRequest::Set {
                 path: resolved_sh,
                 source,
@@ -546,19 +1120,27 @@ fn resolve_preflight_inputs(
     };
 
     let mut normalized_textures = BTreeMap::new();
+    let mut estimated_aux_bytes = HashMap::new();
     for (name, opt_spec) in &tx.textures {
         let clean_name = name.trim();
         if clean_name.is_empty() {
-            bail!("empty texture uniform name");
+            return Err(coded_err(
+                IpcErrorCode::InvalidInput,
+                "empty texture uniform name",
+            ));
         }
         if let Some(spec) = opt_spec {
             let abs_path = absolutize_path(&spec.path);
             if !abs_path.is_file() {
-                bail!(
-                    "texture '{clean_name}' file does not exist: {}",
-                    abs_path.display()
-                );
+                return Err(coded_err(
+                    IpcErrorCode::MissingSource,
+                    format!(
+                        "texture '{clean_name}' file does not exist: {}",
+                        abs_path.display()
+                    ),
+                ));
             }
+            let (tw, th) = check_image_limits(&abs_path, effective_max_dim, max_image_pixels)?;
             let abs_spec = TextureSpec {
                 path: abs_path,
                 filter: spec.filter,
@@ -566,6 +1148,12 @@ fn resolve_preflight_inputs(
                 flip_y: spec.flip_y,
             };
             let key = TextureKey::from_spec(&abs_spec);
+            estimated_aux_bytes.insert(
+                key.clone(),
+                u64::from(tw)
+                    .saturating_mul(u64::from(th))
+                    .saturating_mul(4),
+            );
             normalized_textures.insert(clean_name.to_string(), Some((abs_spec, key)));
         } else {
             normalized_textures.insert(clean_name.to_string(), None);
@@ -586,7 +1174,7 @@ fn resolve_preflight_inputs(
 
     let transition_source =
         if resolved_media.is_some() && slot0_present && tr_dur > 0 && tr_name != "none" {
-            resolve_transition_source(&tr_name)?
+            resolve_transition_source(&tr_name).map_err(map_transition_source_err)?
         } else {
             None
         };
@@ -594,11 +1182,15 @@ fn resolve_preflight_inputs(
     Ok(ResolvedPreflightInputs {
         next_revision,
         resolved_media,
+        target_sig,
+        shader_sig,
         shader_request,
         clear_implicit_shader,
         transition_spec,
         transition_source,
         normalized_textures,
+        estimated_media_bytes,
+        estimated_aux_bytes,
     })
 }
 
@@ -623,13 +1215,18 @@ where
         ShaderRequest::Keep => StagedShader::Keep,
         ShaderRequest::Clear | ShaderRequest::Set { .. } => StagedShader::Clear,
     };
+    let clear_transient = tx.media.is_some() || !matches!(pre.shader_request, ShaderRequest::Keep);
 
     *prepared_slot = Some(PreparedTransaction {
         next_revision: pre.next_revision,
         shader: initial_shader,
+        target_sig: pre.target_sig,
+        shader_sig: pre.shader_sig,
         resolved_media: pre.resolved_media.clone(),
         spawned_job: None,
         transition_spec: pre.transition_spec.clone(),
+        applied_transition: pre.transition_spec.clone(),
+        clear_transient,
         transition_prog: None,
         texture_updates: pre.normalized_textures.clone(),
         uniform_updates: tx.uniforms.clone(),
@@ -639,7 +1236,8 @@ where
     let prep = prepared_slot.as_mut().unwrap();
 
     if let ShaderRequest::Set { path, source } = &pre.shader_request {
-        let prog = compile_prog(source)?;
+        let prog = compile_prog(source)
+            .map_err(|e| coded_err(IpcErrorCode::ShaderCompile, format!("{e:#}")))?;
         prep.shader = StagedShader::Set {
             path: path.clone(),
             program: Box::new(prog),
@@ -653,12 +1251,14 @@ where
     };
     if let Some(prog) = active_prog_ref {
         for (name, val) in &tx.uniforms {
-            prog.validate_uniform(name, val)?;
+            prog.validate_uniform(name, val)
+                .map_err(|e| coded_err(IpcErrorCode::TypeMismatch, format!("{e:#}")))?;
         }
     }
 
     if let Some(tr_src) = &pre.transition_source {
-        let tr_prog = compile_prog(tr_src)?;
+        let tr_prog = compile_prog(tr_src)
+            .map_err(|e| coded_err(IpcErrorCode::ShaderCompile, format!("{e:#}")))?;
         prep.transition_prog = Some(tr_prog);
     }
 
@@ -672,13 +1272,15 @@ where
             media.fps.or(entry_spec.fps).or(default_fps_cap),
             paused,
             media_tx.clone(),
-        )?;
+        )
+        .map_err(|e| coded_err(IpcErrorCode::Unavailable, format!("{e:#}")))?;
         prep.spawned_job = Some(job);
     }
 
     Ok(())
 }
 
+#[cfg(test)]
 fn abort_prepared_transactions(
     prepared: Vec<(usize, PreparedTransaction)>,
     gl_opt: Option<&glow::Context>,
@@ -862,12 +1464,83 @@ impl AppCore {
         crate::gpu::renderer::retry_retired_cuda(gl);
     }
 
-    fn cancel_output_pending(&mut self, idx: usize, reason: &str) {
+    fn cancel_pending_single(
+        &mut self,
+        idx: usize,
+        reason: &str,
+        revert_media: bool,
+    ) -> Option<String> {
         let out_name = self.outputs[idx].name.clone();
-        if let Some(pending) = self.outputs[idx].pending_apply.take() {
-            self.release_pending_apply(pending, Some(reason));
+        let pending = self.outputs[idx].pending_apply.take();
+        let mut group_id = None;
+        let mut awaiting_gen = None;
+        if let Some(p) = pending {
+            group_id = p.group_id.clone();
+            awaiting_gen = p.awaiting_media_gen;
+            self.release_pending_apply(p, Some(reason));
         }
-        self.fail_commit_waiters_for_output(&out_name, reason);
+        self.outputs[idx].pending_generation = None;
+
+        if revert_media {
+            let entry = &mut self.outputs[idx];
+            if entry.waiting_target_frame && awaiting_gen == Some(entry.generation) {
+                entry.waiting_target_frame = false;
+                if let Some(failed_job) = entry.job.take() {
+                    failed_job.stop();
+                }
+                entry.job = entry.prev_job.take();
+                if let Some(ref job) = entry.job {
+                    job.set_paused(self.pause.is_paused(&entry.name));
+                }
+                if let Some(prev_slot) = entry.slot1.take() {
+                    let old = std::mem::replace(&mut entry.slot0, prev_slot);
+                    self.deferred_slots.push(old);
+                }
+                if let Some(tr) = entry.transition_program.take() {
+                    self.deferred_programs.push(tr);
+                }
+                entry.surface.dirty = true;
+            } else if awaiting_gen == Some(entry.generation)
+                && let Some(job) = entry.job.take()
+            {
+                job.stop();
+            }
+        }
+
+        let code = if reason.contains("superseded")
+            || reason.contains("aborted")
+            || reason.contains("removed")
+        {
+            IpcErrorCode::Canceled
+        } else {
+            IpcErrorCode::RenderFailed
+        };
+        self.fail_commit_waiters_for_output(&out_name, code, reason);
+        group_id
+    }
+
+    fn cancel_batch_siblings(&mut self, group_id: &str, failed_idx: usize, reason: &str) {
+        let siblings: Vec<usize> = self
+            .outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| {
+                (i != failed_idx
+                    && o.pending_apply.as_ref().and_then(|p| p.group_id.as_deref())
+                        == Some(group_id))
+                .then_some(i)
+            })
+            .collect();
+        let abort_msg = format!("batch '{group_id}' aborted: {reason}");
+        for j in siblings {
+            self.cancel_pending_single(j, &abort_msg, true);
+        }
+    }
+
+    fn cancel_output_pending(&mut self, idx: usize, reason: &str) {
+        if let Some(gid) = self.cancel_pending_single(idx, reason, false) {
+            self.cancel_batch_siblings(&gid, idx, reason);
+        }
     }
 
     fn arm_commit_timeout_timer(&mut self) {
@@ -897,7 +1570,10 @@ impl AppCore {
                 let expired = self.commit_waiters.swap_remove(i);
                 self.ipc_hub.complete_pending_ack(
                     expired.client_id,
-                    &IpcResponse::err("timed out waiting for frame commit"),
+                    &IpcResponse::err_coded(
+                        IpcErrorCode::Timeout,
+                        "timed out waiting for frame commit",
+                    ),
                 );
             } else {
                 i += 1;
@@ -905,7 +1581,12 @@ impl AppCore {
         }
     }
 
-    fn fail_commit_waiters_for_output(&mut self, output_name: &str, message: &str) {
+    fn fail_commit_waiters_for_output(
+        &mut self,
+        output_name: &str,
+        code: IpcErrorCode,
+        message: &str,
+    ) {
         let mut i = 0;
         while i < self.commit_waiters.len() {
             let matches_output = self.commit_waiters[i]
@@ -917,7 +1598,7 @@ impl AppCore {
                 let waiter = self.commit_waiters.swap_remove(i);
                 self.ipc_hub.complete_pending_ack(
                     waiter.client_id,
-                    &IpcResponse::err(format!("{output_name}: {message}")),
+                    &IpcResponse::err_coded(code, format!("{output_name}: {message}")),
                 );
             } else {
                 i += 1;
@@ -950,11 +1631,15 @@ impl AppCore {
                     .iter()
                     .map(|(n, _)| n.as_str())
                     .collect();
-                let resp = IpcResponse::ok_data(json!({
+                let mut payload = json!({
                     "revision": waiter.max_revision,
                     "frame": frame,
                     "outputs": outputs,
-                }));
+                });
+                if let Some(ref gid) = waiter.group_id {
+                    payload["group_id"] = json!(gid);
+                }
+                let resp = IpcResponse::ok_data(payload);
                 self.ipc_hub.complete_pending_ack(waiter.client_id, &resp);
             } else {
                 i += 1;
@@ -1019,13 +1704,15 @@ impl AppCore {
         // Only update non-resource defaults now so target/shader/bindings remain
         // unmaterialized until execute_transaction actually stages them.
         {
-            let spec = &mut self.outputs[idx].spec;
+            let entry = &mut self.outputs[idx];
+            let spec = &mut entry.spec;
             spec.fit = fit;
             spec.transition = transition.clone();
             spec.duration_ms = duration_ms;
             spec.params = params;
             spec.fps = fps;
             spec.hwaccel = hwaccel;
+            entry.last_transition = (transition.clone(), duration_ms);
         }
 
         let tx = TxParams {
@@ -1063,78 +1750,350 @@ impl AppCore {
         waiter_client: Option<IpcClientId>,
         qh: &wayland_client::QueueHandle<WaylandContext<Self>>,
     ) -> Result<DispatchOutcome> {
-        let targets = self.find_outputs_matching(&tx.output);
-        if targets.is_empty() {
-            bail!("no connected Wayland output matches '{}'", tx.output);
+        let wait_commit = tx.wait_commit;
+        self.execute_transaction_group(vec![tx], None, wait_commit, waiter_client, qh)
+    }
+
+    fn execute_batch_transaction(
+        &mut self,
+        group_id: String,
+        wait_commit: bool,
+        outputs: Vec<BatchOutputApply>,
+        waiter_client: Option<IpcClientId>,
+        qh: &wayland_client::QueueHandle<WaylandContext<Self>>,
+    ) -> Result<DispatchOutcome> {
+        if group_id.trim().is_empty() {
+            return Err(coded_err(
+                IpcErrorCode::InvalidInput,
+                "apply_batch group_id cannot be empty",
+            ));
+        }
+        if outputs.is_empty() {
+            return Err(coded_err(
+                IpcErrorCode::InvalidInput,
+                "apply_batch requires at least one output entry",
+            ));
+        }
+        if self.outputs.iter().any(|o| {
+            o.pending_apply.as_ref().and_then(|p| p.group_id.as_deref()) == Some(group_id.as_str())
+        }) {
+            return Err(coded_err(
+                IpcErrorCode::RevisionConflict,
+                format!("batch group_id '{group_id}' is already in flight"),
+            ));
         }
 
-        for (name, val) in &tx.uniforms {
-            if !val.is_finite() {
-                bail!("uniform '{name}' has non-finite value");
+        let txs: Vec<TxParams> = outputs
+            .into_iter()
+            .map(|o| TxParams {
+                output: o.output,
+                revision: o.revision,
+                media: o.media,
+                shader: o.shader,
+                textures: o.textures,
+                uniforms: o.uniforms,
+                params: None,
+                transition: o.transition,
+                persist_transition_defaults: false,
+                persist: true,
+                wait_commit,
+            })
+            .collect();
+
+        self.execute_transaction_group(txs, Some(group_id), wait_commit, waiter_client, qh)
+    }
+
+    fn execute_transaction_group(
+        &mut self,
+        txs: Vec<TxParams>,
+        group_id: Option<String>,
+        wait_commit: bool,
+        waiter_client: Option<IpcClientId>,
+        qh: &wayland_client::QueueHandle<WaylandContext<Self>>,
+    ) -> Result<DispatchOutcome> {
+        enum PreflightSlot {
+            Idempotent {
+                idx: usize,
+                revision: u64,
+                out_name: String,
+            },
+            Apply {
+                idx: usize,
+                tx: Box<TxParams>,
+                pre: Box<ResolvedPreflightInputs>,
+            },
+        }
+
+        let mut expanded: Vec<(usize, TxParams)> = Vec::new();
+        let mut seen_outputs: HashSet<usize> = HashSet::new();
+        for tx in txs {
+            let targets = self.find_outputs_matching(&tx.output);
+            if targets.is_empty() {
+                return Err(coded_err(
+                    IpcErrorCode::InvalidInput,
+                    format!("no connected Wayland output matches '{}'", tx.output),
+                ));
+            }
+            for &idx in &targets {
+                if group_id.is_some() && !seen_outputs.insert(idx) {
+                    return Err(coded_err(
+                        IpcErrorCode::InvalidInput,
+                        format!(
+                            "duplicate output '{}' in apply_batch",
+                            self.outputs[idx].name
+                        ),
+                    ));
+                }
+            }
+            for &idx in &targets {
+                expanded.push((idx, tx.clone()));
             }
         }
-        if self.renderer.is_some() && tx.media.is_some() {
-            self.ensure_any_gl_context()?;
+
+        let mut any_media = false;
+        for (_, tx) in &expanded {
+            if tx.media.is_some() {
+                any_media = true;
+            }
+            for (name, val) in &tx.uniforms {
+                if !val.is_finite() {
+                    return Err(coded_err(
+                        IpcErrorCode::InvalidInput,
+                        format!("uniform '{name}' has non-finite value"),
+                    ));
+                }
+            }
+        }
+        if self.renderer.is_some() && any_media {
+            self.ensure_any_gl_context()
+                .map_err(|e| coded_err(IpcErrorCode::Unavailable, format!("{e:#}")))?;
+        }
+
+        let gl_max = self
+            .renderer
+            .as_ref()
+            .map_or(u32::MAX, |r| r.max_texture_size());
+        let effective_max_dim = self.config.max_texture_dimension.max(1).min(gl_max);
+        let max_image_pixels = self.config.max_image_pixels;
+
+        let mut slots: Vec<PreflightSlot> = Vec::with_capacity(expanded.len());
+        let mut new_aux_bytes: HashMap<TextureKey, u64> = HashMap::new();
+        let mut replacement_media_bytes: HashMap<usize, u64> = HashMap::new();
+        let mut has_new_media_or_aux = false;
+
+        for (idx, tx) in expanded {
+            let (entry_name, entry_revision, entry_spec, slot0_present, cur_fp, materialized) = {
+                let entry = &self.outputs[idx];
+                let (fp, mat) = fingerprint_from_output_entry(entry);
+                (
+                    entry.name.clone(),
+                    entry.revision,
+                    entry.spec.clone(),
+                    entry.slot0.kind != SlotMediaKind::None,
+                    fp,
+                    mat,
+                )
+            };
+
+            let pre = resolve_preflight_inputs(
+                &tx,
+                &entry_name,
+                entry_revision,
+                &entry_spec,
+                slot0_present,
+                effective_max_dim,
+                max_image_pixels,
+            )?;
+
+            if tx.revision == Some(entry_revision) {
+                let proj_fp = fingerprint_for_tx(&tx, &pre, &cur_fp);
+                if materialized && proj_fp == cur_fp {
+                    slots.push(PreflightSlot::Idempotent {
+                        idx,
+                        revision: entry_revision,
+                        out_name: entry_name,
+                    });
+                    continue;
+                }
+                return Err(coded_err(
+                    IpcErrorCode::RevisionConflict,
+                    format!(
+                        "revision {entry_revision} on {entry_name} conflicts with active state"
+                    ),
+                ));
+            }
+
+            if pre.estimated_media_bytes > 0 {
+                has_new_media_or_aux = true;
+                replacement_media_bytes.insert(idx, pre.estimated_media_bytes);
+            }
+            for (k, bytes) in &pre.estimated_aux_bytes {
+                if !self.texture_pool.contains_key(k) && !self.inflight_tex_decodes.contains(k) {
+                    has_new_media_or_aux = true;
+                    new_aux_bytes.insert(k.clone(), *bytes);
+                }
+            }
+            slots.push(PreflightSlot::Apply {
+                idx,
+                tx: Box::new(tx),
+                pre: Box::new(pre),
+            });
+        }
+
+        // If every target output matched current state idempotently, return without mutating state.
+        if slots
+            .iter()
+            .all(|s| matches!(s, PreflightSlot::Idempotent { .. }))
+        {
+            let mut max_rev = 0u64;
+            let mut out_names = Vec::with_capacity(slots.len());
+            let mut wait_targets = Vec::new();
+            let mut completed = HashSet::new();
+            let mut last_frame = 0i32;
+
+            for s in &slots {
+                if let PreflightSlot::Idempotent {
+                    idx,
+                    revision,
+                    out_name,
+                } = s
+                {
+                    max_rev = max_rev.max(*revision);
+                    out_names.push(out_name.clone());
+                    let entry = &self.outputs[*idx];
+                    if entry.pending_apply.is_none() && !entry.surface.dirty {
+                        completed.insert(out_name.clone());
+                        last_frame = entry.frame_index;
+                    }
+                    wait_targets.push((out_name.clone(), *revision));
+                }
+            }
+
+            if wait_commit
+                && completed.len() < wait_targets.len()
+                && let Some(client_id) = waiter_client
+            {
+                self.ipc_hub.retain_pending_ack(client_id);
+                self.commit_waiters.push(CommitWaiter {
+                    client_id,
+                    group_id,
+                    revision_targets: wait_targets,
+                    completed,
+                    max_revision: max_rev,
+                    deadline: Instant::now() + WAIT_COMMIT_TIMEOUT,
+                });
+                self.arm_commit_timeout_timer();
+                return Ok(DispatchOutcome::Deferred);
+            }
+
+            let mut payload = json!({
+                "revision": max_rev,
+                "idempotent": true,
+                "outputs": out_names,
+            });
+            if completed.len() == out_names.len() {
+                payload["frame"] = json!(last_frame);
+            }
+            if let Some(ref gid) = group_id {
+                payload["group_id"] = json!(gid);
+            }
+            return Ok(DispatchOutcome::Reply(IpcResponse::ok_data(payload)));
+        }
+
+        // Check auxiliary decode queue capacity and projected GPU texture memory budget across the batch.
+        if !new_aux_bytes.is_empty() && !aux_decode_has_capacity(new_aux_bytes.len()) {
+            return Err(coded_err(
+                IpcErrorCode::ResourceLimit,
+                format!(
+                    "auxiliary texture decode queue capacity exceeded by {} new textures",
+                    new_aux_bytes.len()
+                ),
+            ));
+        }
+        if self.config.max_gpu_texture_bytes > 0 && has_new_media_or_aux {
+            let r_opt = self.renderer.as_ref();
+            let mut projected_gpu = self.texture_pool.estimated_gpu_bytes();
+            projected_gpu =
+                projected_gpu.saturating_add(new_aux_bytes.values().copied().sum::<u64>());
+            for (o_idx, entry) in self.outputs.iter().enumerate() {
+                let resolve = r_opt.map_or(0, |r| r.resolve_target_gpu_bytes(&entry.name));
+                let media_bytes = match replacement_media_bytes.get(&o_idx) {
+                    Some(new_b) => *new_b,
+                    None => entry.slot0.estimated_gpu_bytes(),
+                };
+                projected_gpu = projected_gpu
+                    .saturating_add(media_bytes)
+                    .saturating_add(entry.slot1.as_ref().map_or(0, |s| s.estimated_gpu_bytes()))
+                    .saturating_add(resolve);
+            }
+            if projected_gpu > self.config.max_gpu_texture_bytes {
+                return Err(coded_err(
+                    IpcErrorCode::ResourceLimit,
+                    format!(
+                        "projected GPU texture memory ({projected_gpu} bytes) exceeds max_gpu_texture_bytes ({})",
+                        self.config.max_gpu_texture_bytes
+                    ),
+                ));
+            }
         }
 
         // Pre-validate and compile everything per-output before mutating any live state.
-        let mut prepared: Vec<(usize, PreparedTransaction)> = Vec::with_capacity(targets.len());
+        let mut prepared: Vec<(usize, TxParams, PreparedTransaction)> = Vec::new();
+        let mut idempotent_wait_targets: Vec<(String, u64)> = Vec::new();
+        let mut max_rev = 0u64;
+
         let preflight_res: Result<()> = (|| {
-            for &idx in &targets {
-                let (
-                    entry_name,
-                    entry_revision,
-                    entry_generation,
-                    entry_spec,
-                    slot0_present,
-                    paused,
-                ) = {
-                    let entry = &self.outputs[idx];
-                    (
-                        entry.name.clone(),
-                        entry.revision,
-                        entry.generation,
-                        entry.spec.clone(),
-                        entry.slot0.kind != SlotMediaKind::None,
-                        self.pause.is_paused(&entry.name),
-                    )
-                };
+            for slot in slots {
+                match slot {
+                    PreflightSlot::Idempotent {
+                        revision, out_name, ..
+                    } => {
+                        max_rev = max_rev.max(revision);
+                        idempotent_wait_targets.push((out_name, revision));
+                    }
+                    PreflightSlot::Apply { idx, tx, pre } => {
+                        if pre.needs_gl() {
+                            self.ensure_any_gl_context().map_err(|e| {
+                                coded_err(IpcErrorCode::Unavailable, format!("{e:#}"))
+                            })?;
+                        }
+                        let (entry_name, entry_generation, entry_spec, paused) = {
+                            let entry = &self.outputs[idx];
+                            (
+                                entry.name.clone(),
+                                entry.generation,
+                                entry.spec.clone(),
+                                self.pause.is_paused(&entry.name),
+                            )
+                        };
+                        let gl_opt = self.renderer.as_ref().map(|r| &r.gl);
+                        let existing_program = self.outputs[idx].custom_program.as_ref();
 
-                let pre = resolve_preflight_inputs(
-                    &tx,
-                    &entry_name,
-                    entry_revision,
-                    &entry_spec,
-                    slot0_present,
-                )?;
-                if pre.needs_gl() {
-                    self.ensure_any_gl_context()?;
+                        let mut stage_slot = None;
+                        let res = stage_output_transaction(
+                            &tx,
+                            &pre,
+                            &entry_name,
+                            entry_generation,
+                            &entry_spec,
+                            existing_program,
+                            paused,
+                            self.config.fps_cap,
+                            &self.media_tx,
+                            &mut stage_slot,
+                            |src| {
+                                let gl = gl_opt.ok_or_else(|| {
+                                    coded_err(IpcErrorCode::Unavailable, "renderer not initialized")
+                                })?;
+                                GlProgram::compile(gl, src)
+                            },
+                        );
+                        if let Some(prep) = stage_slot {
+                            prepared.push((idx, *tx, prep));
+                        }
+                        res?;
+                    }
                 }
-                let gl_opt = self.renderer.as_ref().map(|r| &r.gl);
-                let existing_program = self.outputs[idx].custom_program.as_ref();
-
-                let mut slot = None;
-                let res = stage_output_transaction(
-                    &tx,
-                    &pre,
-                    &entry_name,
-                    entry_generation,
-                    &entry_spec,
-                    existing_program,
-                    paused,
-                    self.config.fps_cap,
-                    &self.media_tx,
-                    &mut slot,
-                    |src| {
-                        let gl =
-                            gl_opt.ok_or_else(|| anyhow::anyhow!("renderer not initialized"))?;
-                        GlProgram::compile(gl, src)
-                    },
-                );
-                if let Some(prep) = slot {
-                    prepared.push((idx, prep));
-                }
-                res?;
             }
             Ok(())
         })();
@@ -1142,17 +2101,20 @@ impl AppCore {
         if let Err(err) = preflight_res {
             let _ = self.ensure_any_gl_context();
             let gl_opt = self.renderer.as_ref().map(|r| &r.gl);
-            abort_prepared_transactions(prepared, gl_opt);
+            for (_, _, prep) in prepared {
+                prep.destroy_staged(gl_opt);
+            }
             return Err(err);
         }
 
-        // Pre-flight succeeded! Now apply pre-spawned media jobs & stage atomic visual updates.
-        let mut wait_targets: Vec<(String, u64)> = Vec::new();
-        let mut max_rev = 0u64;
-        let mut keys_to_spawn: Vec<TextureKey> = Vec::new();
+        // Pre-flight succeeded! Stage PendingApply on ALL affected outputs BEFORE trying any commits
+        // so batch barriers see every sibling PendingApply atomically.
+        let mut wait_targets = idempotent_wait_targets;
+        let mut keys_to_spawn: Vec<(usize, TextureKey)> = Vec::new();
+        let mut staged_indices: Vec<usize> = Vec::with_capacity(prepared.len());
         let mut stopped_animated = false;
 
-        for (idx, mut prep) in prepared {
+        for (idx, tx, mut prep) in prepared {
             self.cancel_output_pending(idx, "superseded by newer apply");
 
             let is_standalone_shader = tx.media.as_ref().is_some_and(|m| {
@@ -1160,7 +2122,7 @@ impl AppCore {
                 MediaKind::from_path(&p) == Some(MediaKind::ProceduralShader)
             });
 
-            if let Some((tr_name, tr_dur)) = prep.transition_spec
+            if let Some((tr_name, tr_dur)) = prep.transition_spec.clone()
                 && tx.persist_transition_defaults
             {
                 let entry = &mut self.outputs[idx];
@@ -1314,18 +2276,23 @@ impl AppCore {
                 } else if pending_keys.insert(key.clone())
                     && self.inflight_tex_decodes.insert(key.clone())
                 {
-                    keys_to_spawn.push(key.clone());
+                    keys_to_spawn.push((idx, key.clone()));
                 }
             }
 
             let out_name = self.outputs[idx].name.clone();
             max_rev = max_rev.max(prep.next_revision);
             wait_targets.push((out_name, prep.next_revision));
-
+            self.outputs[idx].pending_generation = Some(self.outputs[idx].generation);
             self.outputs[idx].pending_apply = Some(PendingApply {
                 revision: prep.next_revision,
+                group_id: group_id.clone(),
                 persist: tx.persist,
                 shader: prep.shader,
+                target_sig: prep.target_sig,
+                shader_sig: prep.shader_sig,
+                applied_transition: prep.applied_transition,
+                clear_transient: prep.clear_transient,
                 texture_updates: prep.texture_updates,
                 acquired_textures,
                 pending_keys,
@@ -1335,12 +2302,22 @@ impl AppCore {
                 clear_implicit_shader: prep.clear_implicit_shader,
                 awaiting_media_gen,
             });
-
-            self.try_commit_pending_apply(idx, qh);
+            staged_indices.push(idx);
         }
 
-        for key in keys_to_spawn {
-            decode_texture_async(key, self.media_tx.clone());
+        for (owner_idx, key) in keys_to_spawn {
+            if let Err(err) = decode_texture_async(key.clone(), self.media_tx.clone()) {
+                self.inflight_tex_decodes.remove(&key);
+                let msg = format!("{err:#}");
+                self.cancel_output_pending(owner_idx, &msg);
+                return Err(err);
+            }
+        }
+
+        for idx in staged_indices {
+            if self.outputs[idx].pending_apply.is_some() {
+                self.try_commit_pending_apply(idx, qh);
+            }
         }
 
         if stopped_animated {
@@ -1348,9 +2325,7 @@ impl AppCore {
             unsafe { libc::malloc_trim(0) };
         }
 
-        if tx.wait_commit
-            && let Some(client_id) = waiter_client
-        {
+        if wait_commit && let Some(client_id) = waiter_client {
             // If every target output has already swapped synchronously inside try_commit_pending_apply,
             // wait_commit resolves immediately; otherwise track it asynchronously.
             let mut completed = HashSet::new();
@@ -1367,15 +2342,20 @@ impl AppCore {
             }
             if completed.len() == wait_targets.len() {
                 let outs: Vec<&str> = wait_targets.iter().map(|(n, _)| n.as_str()).collect();
-                return Ok(DispatchOutcome::Reply(IpcResponse::ok_data(json!({
+                let mut payload = json!({
                     "revision": max_rev,
                     "frame": last_frame,
                     "outputs": outs,
-                }))));
+                });
+                if let Some(ref gid) = group_id {
+                    payload["group_id"] = json!(gid);
+                }
+                return Ok(DispatchOutcome::Reply(IpcResponse::ok_data(payload)));
             }
             self.ipc_hub.retain_pending_ack(client_id);
             self.commit_waiters.push(CommitWaiter {
                 client_id,
+                group_id,
                 revision_targets: wait_targets,
                 completed,
                 max_revision: max_rev,
@@ -1385,9 +2365,13 @@ impl AppCore {
             return Ok(DispatchOutcome::Deferred);
         }
 
-        Ok(DispatchOutcome::Reply(IpcResponse::ok_data(json!({
+        let mut payload = json!({
             "revision": max_rev,
-        }))))
+        });
+        if let Some(ref gid) = group_id {
+            payload["group_id"] = json!(gid);
+        }
+        Ok(DispatchOutcome::Reply(IpcResponse::ok_data(payload)))
     }
 
     fn try_commit_pending_apply(
@@ -1395,16 +2379,38 @@ impl AppCore {
         idx: usize,
         qh: &wayland_client::QueueHandle<WaylandContext<Self>>,
     ) {
-        let ready = {
-            let entry = &self.outputs[idx];
-            entry
-                .pending_apply
-                .as_ref()
-                .is_some_and(|p| p.is_ready(entry.generation, entry.slot0_has_first_frame))
+        let Some(pending_ref) = self.outputs[idx].pending_apply.as_ref() else {
+            return;
         };
-        if !ready {
+        let entry = &self.outputs[idx];
+        if !pending_ref.is_ready(entry.generation, entry.slot0_has_first_frame) {
             return;
         }
+
+        let group_indices: Vec<usize> = match pending_ref.group_id.as_deref() {
+            Some(gid) => {
+                let members: Vec<usize> = self
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, o)| {
+                        (o.pending_apply.as_ref().and_then(|p| p.group_id.as_deref()) == Some(gid))
+                            .then_some(i)
+                    })
+                    .collect();
+                for &m_idx in &members {
+                    let m_entry = &self.outputs[m_idx];
+                    let ready = m_entry.pending_apply.as_ref().is_some_and(|p| {
+                        p.is_ready(m_entry.generation, m_entry.slot0_has_first_frame)
+                    });
+                    if !ready {
+                        return;
+                    }
+                }
+                members
+            }
+            None => vec![idx],
+        };
 
         if self.renderer.is_some()
             && let Err(err) = self.ensure_any_gl_context()
@@ -1413,167 +2419,202 @@ impl AppCore {
             return;
         }
 
-        let mut pending = self.outputs[idx].pending_apply.take().unwrap();
+        let mut shader_changed_any = false;
+        let mut caches_to_clear = Vec::new();
+        let mut persist_any = false;
 
-        let (shader_changed, needs_resolve, persist_now, out_name, spec_snapshot) = {
-            let gl_opt = self.renderer.as_ref().map(|r| &r.gl);
-            let entry = &mut self.outputs[idx];
-            let mut sh_changed = false;
+        for &m_idx in &group_indices {
+            let Some(mut pending) = self.outputs[m_idx].pending_apply.take() else {
+                continue;
+            };
 
-            match pending.shader {
-                StagedShader::Keep => {}
-                StagedShader::Clear => {
-                    if let Some(old) = entry.custom_program.take()
-                        && let Some(gl) = gl_opt
-                    {
-                        old.destroy(gl);
-                    }
-                    entry.custom_shader_path = None;
-                    entry.last_shader_error = None;
-                    if pending.clear_implicit_shader || entry.spec.shader.is_some() {
-                        entry.spec.shader = None;
-                    }
-                    // With no shader, auxiliary textures and uniforms have no consumer —
-                    // release every pool ref and drop the spec entries. Any bindings
-                    // explicitly supplied in this same apply are re-inserted below.
-                    let empty = HashSet::new();
-                    let removed = prune_shader_bindings(
-                        &mut entry.custom_textures,
-                        &mut entry.spec.textures,
-                        &mut entry.custom_uniforms,
-                        &mut entry.spec.uniforms,
-                        &empty,
-                        &empty,
-                    );
-                    if let Some(gl) = gl_opt {
-                        for old_id in removed {
-                            self.texture_pool.release(gl, old_id);
-                        }
-                    }
-                    sh_changed = true;
+            let (shader_changed, needs_resolve, persist_now, out_name, spec_snapshot) = {
+                let gl_opt = self.renderer.as_ref().map(|r| &r.gl);
+                let entry = &mut self.outputs[m_idx];
+                let mut sh_changed = false;
+
+                if pending.clear_transient {
+                    entry.transient.clear();
                 }
-                StagedShader::Set { path, program } => {
-                    if let Some(gl) = gl_opt {
-                        apply_program_and_prune(
-                            gl,
-                            *program,
-                            &mut entry.custom_program,
+
+                match pending.shader {
+                    StagedShader::Keep => {}
+                    StagedShader::Clear => {
+                        if let Some(old) = entry.custom_program.take()
+                            && let Some(gl) = gl_opt
+                        {
+                            old.destroy(gl);
+                        }
+                        entry.custom_shader_path = None;
+                        entry.shader_sig = None;
+                        entry.last_shader_error = None;
+                        if pending.clear_implicit_shader || entry.spec.shader.is_some() {
+                            entry.spec.shader = None;
+                        }
+                        let empty = HashSet::new();
+                        entry.transient.prune(&empty);
+                        let removed = prune_shader_bindings(
                             &mut entry.custom_textures,
+                            &mut entry.custom_texture_keys,
                             &mut entry.spec.textures,
                             &mut entry.custom_uniforms,
                             &mut entry.spec.uniforms,
-                            &mut self.texture_pool,
+                            &empty,
+                            &empty,
                         );
-                    } else {
-                        let allowed_samplers: HashSet<String> = program
-                            .user_samplers
-                            .iter()
-                            .map(|s| s.name.clone())
-                            .collect();
+                        if let Some(gl) = gl_opt {
+                            for old_id in removed {
+                                self.texture_pool.release(gl, old_id);
+                            }
+                        }
+                        sh_changed = true;
+                    }
+                    StagedShader::Set { path, program } => {
                         let allowed_uniforms: HashSet<String> = program
                             .user_uniforms
                             .iter()
                             .map(|u| u.name.clone())
                             .collect();
-                        if let Some(old) = entry.custom_program.replace(*program) {
-                            self.deferred_programs.push(old);
+                        entry.transient.prune(&allowed_uniforms);
+                        if let Some(gl) = gl_opt {
+                            apply_program_and_prune(
+                                gl,
+                                *program,
+                                &mut entry.custom_program,
+                                &mut entry.custom_textures,
+                                &mut entry.custom_texture_keys,
+                                &mut entry.spec.textures,
+                                &mut entry.custom_uniforms,
+                                &mut entry.spec.uniforms,
+                                &mut self.texture_pool,
+                            );
+                        } else {
+                            let allowed_samplers: HashSet<String> = program
+                                .user_samplers
+                                .iter()
+                                .map(|s| s.name.clone())
+                                .collect();
+                            if let Some(old) = entry.custom_program.replace(*program) {
+                                self.deferred_programs.push(old);
+                            }
+                            let _ = prune_shader_bindings(
+                                &mut entry.custom_textures,
+                                &mut entry.custom_texture_keys,
+                                &mut entry.spec.textures,
+                                &mut entry.custom_uniforms,
+                                &mut entry.spec.uniforms,
+                                &allowed_samplers,
+                                &allowed_uniforms,
+                            );
                         }
-                        let _ = prune_shader_bindings(
-                            &mut entry.custom_textures,
-                            &mut entry.spec.textures,
-                            &mut entry.custom_uniforms,
-                            &mut entry.spec.uniforms,
-                            &allowed_samplers,
-                            &allowed_uniforms,
-                        );
+                        let canonical = path.to_string_lossy().to_string();
+                        entry.custom_shader_path = Some(path);
+                        entry.shader_sig = pending.shader_sig;
+                        entry.last_shader_error = None;
+                        entry.spec.shader = Some(canonical.clone());
+                        if entry.job.is_none() && pending.target_override.is_some() {
+                            entry.spec.shader = Some(canonical);
+                        }
+                        sh_changed = true;
                     }
-                    let canonical = path.to_string_lossy().to_string();
-                    entry.custom_shader_path = Some(path);
-                    entry.last_shader_error = None;
-                    entry.spec.shader = Some(canonical.clone());
-                    if entry.job.is_none() && pending.target_override.is_some() {
-                        entry.spec.shader = Some(canonical);
+                }
+
+                if let Some(target_str) = pending.target_override.take() {
+                    entry.spec.target = Some(target_str);
+                    entry.target_sig = pending.target_sig;
+                }
+                if let Some(tr_pair) = pending.applied_transition.take() {
+                    entry.last_transition = tr_pair;
+                }
+
+                for (name, opt_entry) in pending.texture_updates {
+                    if let Some(old_id) = entry.custom_textures.remove(&name)
+                        && let Some(gl) = gl_opt
+                    {
+                        self.texture_pool.release(gl, old_id);
                     }
-                    sh_changed = true;
-                }
-            }
-
-            if let Some(target_str) = pending.target_override.take() {
-                entry.spec.target = Some(target_str);
-            }
-
-            for (name, opt_entry) in pending.texture_updates {
-                if let Some(old_id) = entry.custom_textures.remove(&name)
-                    && let Some(gl) = gl_opt
-                {
-                    self.texture_pool.release(gl, old_id);
-                }
-                match opt_entry {
-                    Some((spec, key)) => {
-                        if let Some(tex_id) = pending
-                            .acquired_textures
-                            .remove(&key)
-                            .or_else(|| self.texture_pool.acquire(&key))
-                        {
-                            entry.custom_textures.insert(name.clone(), tex_id);
-                            entry.spec.textures.insert(name, spec);
+                    entry.custom_texture_keys.remove(&name);
+                    match opt_entry {
+                        Some((spec, key)) => {
+                            if let Some(tex_id) = pending
+                                .acquired_textures
+                                .remove(&key)
+                                .or_else(|| self.texture_pool.acquire(&key))
+                            {
+                                entry.custom_textures.insert(name.clone(), tex_id);
+                                entry.custom_texture_keys.insert(name.clone(), key);
+                                entry.spec.textures.insert(name, spec);
+                            }
+                        }
+                        None => {
+                            entry.spec.textures.remove(&name);
                         }
                     }
-                    None => {
-                        entry.spec.textures.remove(&name);
+                }
+                // Release any duplicate staging refs left in acquired_textures.
+                if let Some(gl) = gl_opt {
+                    for (_, id) in pending.acquired_textures.drain() {
+                        self.texture_pool.release(gl, id);
                     }
                 }
-            }
-            // Release any duplicate staging refs left in acquired_textures.
-            if let Some(gl) = gl_opt {
-                for (_, id) in pending.acquired_textures.drain() {
-                    self.texture_pool.release(gl, id);
+
+                for (name, val) in pending.uniform_updates {
+                    entry.custom_uniforms.insert(name.clone(), val.clone());
+                    entry.spec.uniforms.insert(name, val);
+                }
+
+                if let Some(params) = pending.params_update {
+                    entry.spec.params = params;
+                }
+
+                entry.revision = entry.revision.max(pending.revision);
+                entry.pending_generation = None;
+                entry.active_generation = entry.generation;
+
+                if entry.waiting_target_frame && entry.slot0_has_first_frame {
+                    entry.waiting_target_frame = false;
+                    entry.in_transition = true;
+                    entry.transition_started = Some(Instant::now());
+                }
+
+                entry.surface.dirty = true;
+                entry.last_tick = Instant::now();
+
+                (
+                    sh_changed,
+                    entry.needs_resolve_target(),
+                    pending.persist,
+                    entry.name.clone(),
+                    entry.spec.clone(),
+                )
+            };
+
+            if shader_changed {
+                shader_changed_any = true;
+                if !needs_resolve {
+                    caches_to_clear.push(out_name.clone());
                 }
             }
-
-            for (name, val) in pending.uniform_updates {
-                entry.custom_uniforms.insert(name.clone(), val.clone());
-                entry.spec.uniforms.insert(name, val);
+            if persist_now {
+                self.persisted.outputs.insert(out_name, spec_snapshot);
+                persist_any = true;
             }
-
-            if let Some(params) = pending.params_update {
-                entry.spec.params = params;
-            }
-
-            entry.revision = entry.revision.max(pending.revision);
-
-            if entry.waiting_target_frame && entry.slot0_has_first_frame {
-                entry.waiting_target_frame = false;
-                entry.in_transition = true;
-                entry.transition_started = Some(Instant::now());
-            }
-
-            entry.surface.dirty = true;
-            entry.last_tick = Instant::now();
-
-            (
-                sh_changed,
-                entry.needs_resolve_target(),
-                pending.persist,
-                entry.name.clone(),
-                entry.spec.clone(),
-            )
-        };
-
-        if shader_changed
-            && !needs_resolve
-            && let Some(ref mut r) = self.renderer
-        {
-            r.remove_output_cache(&out_name);
         }
-        if persist_now {
-            self.persisted.outputs.insert(out_name, spec_snapshot);
+
+        if let Some(ref mut r) = self.renderer {
+            for out_name in caches_to_clear {
+                r.remove_output_cache(&out_name);
+            }
+        }
+        if persist_any {
             self.save_state();
         }
-        if shader_changed {
+        if shader_changed_any {
             self.sync_shader_watcher();
         }
-        self.render_if_ready(idx, qh);
+        for m_idx in group_indices {
+            self.render_if_ready(m_idx, qh);
+        }
     }
 
     fn handle_media_event(
@@ -1656,12 +2697,14 @@ impl AppCore {
                     self.texture_pool.release(&r.gl, base_id);
                 }
             }
-            MediaEvent::AuxTextureError { key, message } => {
+            MediaEvent::AuxTextureError { key, code, message } => {
                 self.inflight_tex_decodes.remove(&key);
                 tracing::error!(
-                    "auxiliary texture decode failed ({}): {message}",
+                    "auxiliary texture decode failed [{}] ({}): {message}",
+                    code.as_str(),
                     key.path.display()
                 );
+                let _ = code;
                 for idx in 0..self.outputs.len() {
                     if self.outputs[idx]
                         .pending_apply
@@ -1675,6 +2718,7 @@ impl AppCore {
             MediaEvent::Error {
                 output,
                 generation,
+                code,
                 message,
             } => {
                 let Some(idx) = self.outputs.iter().position(|o| o.name == output) else {
@@ -1687,10 +2731,11 @@ impl AppCore {
                 {
                     return;
                 }
-                tracing::error!("media error on {output}: {message}");
+                tracing::error!("media error on {output} [{}]: {message}", code.as_str());
                 self.outputs[idx].last_media_error = Some(message.clone());
                 self.ipc_hub.broadcast_event(&IpcEvent::MediaError {
                     output: output.clone(),
+                    code: Some(code),
                     message: message.clone(),
                 });
 
@@ -1704,6 +2749,7 @@ impl AppCore {
                 }
 
                 let entry = &mut self.outputs[idx];
+                entry.pending_generation = None;
                 if entry.waiting_target_frame {
                     // Revert pending transition cleanly back to previous slot1.
                     entry.waiting_target_frame = false;
@@ -1912,6 +2958,7 @@ impl AppCore {
                     &src,
                     &mut entry.custom_program,
                     &mut entry.custom_textures,
+                    &mut entry.custom_texture_keys,
                     &mut entry.spec.textures,
                     &mut entry.custom_uniforms,
                     &mut entry.spec.uniforms,
@@ -1922,8 +2969,14 @@ impl AppCore {
                 Ok(()) => {
                     let entry = &mut self.outputs[idx];
                     entry.revision += 1;
+                    entry.shader_sig = file_stat_sig(&path);
                     entry.last_shader_error = None;
                     entry.surface.dirty = true;
+                    if let Some(ref prog) = entry.custom_program {
+                        let allowed_uniforms: HashSet<String> =
+                            prog.user_uniforms.iter().map(|u| u.name.clone()).collect();
+                        entry.transient.prune(&allowed_uniforms);
+                    }
                     let out_name = entry.name.clone();
                     let rev = entry.revision;
                     if !entry.needs_resolve_target() {
@@ -1934,15 +2987,18 @@ impl AppCore {
                         output: out_name,
                         revision: rev,
                         ok: true,
+                        code: None,
                         error: None,
                     });
                 }
                 Err(err) => {
-                    let msg = err.to_string();
+                    let code = error_code_of(&err, IpcErrorCode::ShaderCompile);
+                    let msg = format!("{err:#}");
                     let entry = &mut self.outputs[idx];
                     tracing::warn!(
-                        "shader hot-reload compile failed on {} (keeping active shader): {msg}",
-                        entry.name
+                        "shader hot-reload compile failed on {} [{}] (keeping active shader): {msg}",
+                        entry.name,
+                        code.as_str()
                     );
                     entry.last_shader_error = Some(msg.clone());
                     let out_name = entry.name.clone();
@@ -1951,6 +3007,7 @@ impl AppCore {
                         output: out_name,
                         revision: rev,
                         ok: false,
+                        code: Some(code),
                         error: Some(msg),
                     });
                 }
@@ -2015,6 +3072,7 @@ impl AppCore {
                 entry.frame_index = entry.frame_index.wrapping_add(1);
             }
             entry.last_tick = now;
+            entry.transient.consume_pending();
 
             if entry.in_transition {
                 let dur = Duration::from_millis(u64::from(entry.spec.duration_ms.max(1)));
@@ -2051,6 +3109,7 @@ impl AppCore {
                 in_transition: entry.in_transition,
                 custom_textures: &entry.custom_textures,
                 custom_uniforms: &entry.custom_uniforms,
+                transient_uniforms: &entry.transient.active_overlay,
             };
             renderer.draw(&draw_params, &self.texture_pool)
         };
@@ -2108,6 +3167,11 @@ impl AppCore {
             } else {
                 false
             };
+            if swapped_ok {
+                entry.last_committed_frame = Some(entry.frame_index);
+                entry.last_committed_revision = entry.revision;
+                entry.active_generation = entry.generation;
+            }
             (
                 entry.name.clone(),
                 entry.revision,
@@ -2130,6 +3194,116 @@ impl AppCore {
             }
             self.resolve_commit_waiters_on_frame(&out_name, revision, frame_index);
         }
+    }
+
+    fn handle_uniforms_transient(
+        &mut self,
+        output: String,
+        session: String,
+        seq: u64,
+        values: BTreeMap<String, UniformValue>,
+        clear: bool,
+        qh: &wayland_client::QueueHandle<WaylandContext<Self>>,
+    ) -> Result<DispatchOutcome> {
+        let trimmed_session = session.trim();
+        if trimmed_session.is_empty() {
+            return Err(coded_err(
+                IpcErrorCode::InvalidInput,
+                "uniforms_transient session cannot be empty",
+            ));
+        }
+        let targets = self.find_outputs_matching(&output);
+        if targets.is_empty() {
+            return Err(coded_err(
+                IpcErrorCode::InvalidInput,
+                format!("no connected Wayland output matches '{output}'"),
+            ));
+        }
+        let values = if clear { BTreeMap::new() } else { values };
+        for (name, val) in &values {
+            if !val.is_finite() {
+                return Err(coded_err(
+                    IpcErrorCode::InvalidInput,
+                    format!("uniform '{name}' has non-finite value"),
+                ));
+            }
+        }
+
+        // Preflight monotonic seq + schema/type validation across all matched outputs before mutating.
+        for &idx in &targets {
+            let entry = &self.outputs[idx];
+            if entry.transient.session == trimmed_session && seq <= entry.transient.last_seq {
+                return Err(coded_err(
+                    IpcErrorCode::RevisionConflict,
+                    format!(
+                        "non-monotonic transient uniform seq {seq} <= {} for session '{trimmed_session}' on {}",
+                        entry.transient.last_seq, entry.name
+                    ),
+                ));
+            }
+            if !values.is_empty() {
+                let prog = entry.custom_program.as_ref().ok_or_else(|| {
+                    coded_err(
+                        IpcErrorCode::TypeMismatch,
+                        format!("output '{}' has no active shader for uniforms", entry.name),
+                    )
+                })?;
+                for (name, val) in &values {
+                    if !prog.user_uniforms.iter().any(|u| u.name == *name) {
+                        return Err(coded_err(
+                            IpcErrorCode::TypeMismatch,
+                            format!(
+                                "unknown uniform '{name}' for active shader on {}",
+                                entry.name
+                            ),
+                        ));
+                    }
+                    prog.validate_uniform(name, val)
+                        .map_err(|e| coded_err(IpcErrorCode::TypeMismatch, format!("{e:#}")))?;
+                }
+            }
+        }
+
+        let mut any_dirty = false;
+        let mut out_names = Vec::with_capacity(targets.len());
+        for idx in targets {
+            let (changed, name) = {
+                let entry = &mut self.outputs[idx];
+                let prev_effective = effective_uniforms_with_overlay(
+                    &entry.custom_uniforms,
+                    entry.transient.current_overlay(),
+                );
+                let next_effective =
+                    effective_uniforms_with_overlay(&entry.custom_uniforms, &values);
+                let changed = prev_effective != next_effective;
+
+                entry.transient.session = trimmed_session.to_string();
+                entry.transient.last_seq = seq;
+                if values.is_empty() {
+                    entry.transient.active_overlay.clear();
+                    entry.transient.pending_overlay = None;
+                } else {
+                    entry.transient.pending_overlay = Some(values.clone());
+                }
+                if changed {
+                    entry.surface.dirty = true;
+                }
+                (changed, entry.name.clone())
+            };
+            out_names.push(name);
+            if changed {
+                any_dirty = true;
+                self.render_if_ready(idx, qh);
+            }
+        }
+
+        Ok(DispatchOutcome::Reply(IpcResponse::ok_data(json!({
+            "session": trimmed_session,
+            "seq": seq,
+            "noop": !any_dirty,
+            "dirty": any_dirty,
+            "outputs": out_names,
+        }))))
     }
 
     fn handle_ipc_line(
@@ -2194,7 +3368,10 @@ impl AppCore {
                 };
                 match self.execute_transaction(tx, Some(client_id), qh) {
                     Ok(out) => out,
-                    Err(err) => DispatchOutcome::Reply(IpcResponse::err(format!("{err:#}"))),
+                    Err(err) => DispatchOutcome::Reply(IpcResponse::from_anyhow(
+                        &err,
+                        IpcErrorCode::InvalidInput,
+                    )),
                 }
             }
             IpcRequest::Shader { output, path } => {
@@ -2206,7 +3383,10 @@ impl AppCore {
                 };
                 match self.execute_transaction(tx, Some(client_id), qh) {
                     Ok(out) => out,
-                    Err(err) => DispatchOutcome::Reply(IpcResponse::err(format!("{err:#}"))),
+                    Err(err) => DispatchOutcome::Reply(IpcResponse::from_anyhow(
+                        &err,
+                        IpcErrorCode::InvalidInput,
+                    )),
                 }
             }
             IpcRequest::Params { output, values } => {
@@ -2218,7 +3398,10 @@ impl AppCore {
                 };
                 match self.execute_transaction(tx, Some(client_id), qh) {
                     Ok(out) => out,
-                    Err(err) => DispatchOutcome::Reply(IpcResponse::err(format!("{err:#}"))),
+                    Err(err) => DispatchOutcome::Reply(IpcResponse::from_anyhow(
+                        &err,
+                        IpcErrorCode::InvalidInput,
+                    )),
                 }
             }
             IpcRequest::Uniform {
@@ -2236,7 +3419,10 @@ impl AppCore {
                 };
                 match self.execute_transaction(tx, Some(client_id), qh) {
                     Ok(out) => out,
-                    Err(err) => DispatchOutcome::Reply(IpcResponse::err(format!("{err:#}"))),
+                    Err(err) => DispatchOutcome::Reply(IpcResponse::from_anyhow(
+                        &err,
+                        IpcErrorCode::InvalidInput,
+                    )),
                 }
             }
             IpcRequest::Uniforms { output, values } => {
@@ -2248,9 +3434,25 @@ impl AppCore {
                 };
                 match self.execute_transaction(tx, Some(client_id), qh) {
                     Ok(out) => out,
-                    Err(err) => DispatchOutcome::Reply(IpcResponse::err(format!("{err:#}"))),
+                    Err(err) => DispatchOutcome::Reply(IpcResponse::from_anyhow(
+                        &err,
+                        IpcErrorCode::InvalidInput,
+                    )),
                 }
             }
+            IpcRequest::UniformsTransient {
+                output,
+                session,
+                seq,
+                values,
+                clear,
+            } => match self.handle_uniforms_transient(output, session, seq, values, clear, qh) {
+                Ok(out) => out,
+                Err(err) => DispatchOutcome::Reply(IpcResponse::from_anyhow(
+                    &err,
+                    IpcErrorCode::InvalidInput,
+                )),
+            },
             IpcRequest::TextureSet {
                 output,
                 name,
@@ -2277,7 +3479,10 @@ impl AppCore {
                 };
                 match self.execute_transaction(tx, Some(client_id), qh) {
                     Ok(out) => out,
-                    Err(err) => DispatchOutcome::Reply(IpcResponse::err(format!("{err:#}"))),
+                    Err(err) => DispatchOutcome::Reply(IpcResponse::from_anyhow(
+                        &err,
+                        IpcErrorCode::InvalidInput,
+                    )),
                 }
             }
             IpcRequest::TextureUnset { output, name } => {
@@ -2291,7 +3496,10 @@ impl AppCore {
                 };
                 match self.execute_transaction(tx, Some(client_id), qh) {
                     Ok(out) => out,
-                    Err(err) => DispatchOutcome::Reply(IpcResponse::err(format!("{err:#}"))),
+                    Err(err) => DispatchOutcome::Reply(IpcResponse::from_anyhow(
+                        &err,
+                        IpcErrorCode::InvalidInput,
+                    )),
                 }
             }
             IpcRequest::Apply {
@@ -2319,7 +3527,36 @@ impl AppCore {
                 };
                 match self.execute_transaction(tx, Some(client_id), qh) {
                     Ok(out) => out,
-                    Err(err) => DispatchOutcome::Reply(IpcResponse::err(format!("{err:#}"))),
+                    Err(err) => DispatchOutcome::Reply(IpcResponse::from_anyhow(
+                        &err,
+                        IpcErrorCode::InvalidInput,
+                    )),
+                }
+            }
+            IpcRequest::ApplyBatch {
+                version,
+                group_id,
+                targets,
+                wait_commit,
+            } => {
+                if version != 1 {
+                    return DispatchOutcome::Reply(IpcResponse::err_coded(
+                        IpcErrorCode::InvalidInput,
+                        format!("unsupported apply_batch version {version} (expected 1)"),
+                    ));
+                }
+                match self.execute_batch_transaction(
+                    group_id,
+                    wait_commit,
+                    targets,
+                    Some(client_id),
+                    qh,
+                ) {
+                    Ok(out) => out,
+                    Err(err) => DispatchOutcome::Reply(IpcResponse::from_anyhow(
+                        &err,
+                        IpcErrorCode::InvalidInput,
+                    )),
                 }
             }
             IpcRequest::Subscribe { .. } => {
@@ -2367,9 +3604,10 @@ impl AppCore {
             IpcRequest::Reload { output } => {
                 let targets = self.find_outputs_matching(&output);
                 if targets.is_empty() {
-                    return DispatchOutcome::Reply(IpcResponse::err(format!(
-                        "no connected Wayland output matches '{output}'"
-                    )));
+                    return DispatchOutcome::Reply(IpcResponse::err_coded(
+                        IpcErrorCode::InvalidInput,
+                        format!("no connected Wayland output matches '{output}'"),
+                    ));
                 }
                 for idx in targets {
                     let spec = self.outputs[idx].spec.clone();
@@ -2401,7 +3639,10 @@ impl AppCore {
                         revision: None,
                     };
                     if let Err(err) = self.execute_transaction(tx, Some(client_id), qh) {
-                        return DispatchOutcome::Reply(IpcResponse::err(format!("{err:#}")));
+                        return DispatchOutcome::Reply(IpcResponse::from_anyhow(
+                            &err,
+                            IpcErrorCode::InvalidInput,
+                        ));
                     }
                 }
                 DispatchOutcome::Reply(IpcResponse::ok_msg("reloaded"))
@@ -2424,6 +3665,7 @@ impl AppCore {
                 DispatchOutcome::Reply(IpcResponse::ok_data(json!({ "outputs": list })))
             }
             IpcRequest::Status => {
+                let r_opt = self.renderer.as_ref();
                 let outputs: Vec<_> = self
                     .outputs
                     .iter()
@@ -2450,6 +3692,12 @@ impl AppCore {
                                 )
                             })
                             .collect();
+                        let paused = self.pause.is_paused(&o.name);
+                        let effective_uniforms = effective_uniforms_with_overlay(
+                            &o.custom_uniforms,
+                            o.transient.current_overlay(),
+                        );
+                        let output_gpu_bytes = o.estimated_gpu_bytes(r_opt);
                         json!({
                             "name": o.name,
                             "revision": o.revision,
@@ -2458,13 +3706,22 @@ impl AppCore {
                             "scale": f64::from(o.surface.scale_120) / 120.0,
                             "configured": o.surface.configured,
                             "target": o.spec.target,
+                            "media_kind": o.media_kind_label(),
+                            "active_generation": o.active_generation,
+                            "pending_generation": o.pending_generation,
+                            "decoder_status": o.decoder_status(paused),
+                            "last_committed_frame": o.last_committed_frame,
+                            "last_committed_revision": o.last_committed_revision,
+                            "estimated_gpu_bytes": output_gpu_bytes,
                             "shader": o.spec.shader,
                             "shader_schema": o.custom_program.as_ref().map(GlProgram::schema),
                             "textures": bound_textures,
-                            "uniforms": o.custom_uniforms,
+                            "uniforms": effective_uniforms,
+                            "uniforms_base": o.custom_uniforms,
+                            "uniforms_transient": o.transient.current_overlay(),
                             "fit": o.spec.fit,
                             "params": o.spec.params,
-                            "paused": self.pause.is_paused(&o.name),
+                            "paused": paused,
                             "pause_reasons": self.pause.reasons_for(&o.name),
                             "continuous": o.uses_continuous_frames(),
                             "shader_mode": o.custom_program.as_ref().map(|p| format!("{:?}", p.assembled.mode)),
@@ -2473,10 +3730,32 @@ impl AppCore {
                         })
                     })
                     .collect();
+                let (aux_workers_active, queued_aux) = aux_decode_stats();
+                let pool_bytes = self.texture_pool.estimated_gpu_bytes();
+                let output_bytes: u64 = self
+                    .outputs
+                    .iter()
+                    .map(|o| o.estimated_gpu_bytes(r_opt))
+                    .sum();
+                let estimated_vram_bytes = pool_bytes.saturating_add(output_bytes);
+                let (rss_kb, pss_kb, private_dirty_kb) = read_self_memory_stats();
                 DispatchOutcome::Reply(IpcResponse::ok_data(json!({
                     "auto_pause_fullscreen": self.config.auto_pause_fullscreen,
                     "persist_state": self.persist_enabled,
                     "pool_textures": self.texture_pool.len(),
+                    "cached_textures": self.texture_pool.len(),
+                    "inflight_aux_decodes": self.inflight_tex_decodes.len(),
+                    "aux_decode_workers_active": aux_workers_active,
+                    "queued_aux_decodes": queued_aux,
+                    "active_media_workers": active_media_workers(),
+                    "active_gstreamer_pipelines": active_pipeline_count(),
+                    "estimated_vram_bytes": estimated_vram_bytes,
+                    "memory": {
+                        "rss_kb": rss_kb,
+                        "pss_kb": pss_kb,
+                        "private_dirty_kb": private_dirty_kb,
+                        "estimated_vram_bytes": estimated_vram_bytes,
+                    },
                     "global_pause_reasons": self.pause.global_reasons(),
                     "outputs": outputs,
                 })))
@@ -2559,8 +3838,10 @@ impl AppCore {
         }
         crate::media::wait_for_reaped_workers();
         for waiter in std::mem::take(&mut self.commit_waiters) {
-            self.ipc_hub
-                .complete_pending_ack(waiter.client_id, &IpcResponse::err("daemon shutting down"));
+            self.ipc_hub.complete_pending_ack(
+                waiter.client_id,
+                &IpcResponse::err_coded(IpcErrorCode::Canceled, "daemon shutting down"),
+            );
         }
         if self.renderer.is_some() {
             if let Err(err) = self.egl.make_current_surfaceless() {
@@ -2584,12 +3865,19 @@ impl AppCore {
         self.egl.unbind_context();
     }
     fn remove_output_at(&mut self, idx: usize, waiter_reason: &str) {
+        let entry_gid = self.outputs[idx]
+            .pending_apply
+            .as_ref()
+            .and_then(|p| p.group_id.clone());
         let entry = self.outputs.remove(idx);
         let name = entry.name.clone();
         let was_announced = entry.name_resolved;
         self.pause.drop_output(&name);
         self.fullscreen_outputs.remove(&name);
-        self.fail_commit_waiters_for_output(&name, waiter_reason);
+        self.fail_commit_waiters_for_output(&name, IpcErrorCode::Canceled, waiter_reason);
+        if let Some(ref gid) = entry_gid {
+            self.cancel_batch_siblings(gid, usize::MAX, waiter_reason);
+        }
         self.teardown_output_entry(entry);
         self.sync_shader_watcher();
         if was_announced {
@@ -2619,6 +3907,7 @@ impl WaylandAppSink for AppCore {
         self.next_output_index += 1;
 
         let spec = self.config.base_spec_for(&name);
+        let last_transition = (spec.transition.clone(), spec.duration_ms);
         self.outputs.push(OutputEntry {
             index,
             wl_output: output,
@@ -2628,6 +3917,13 @@ impl WaylandAppSink for AppCore {
             spec,
             revision: 0,
             generation: 0,
+            active_generation: 0,
+            pending_generation: None,
+            last_committed_frame: None,
+            last_committed_revision: 0,
+            target_sig: None,
+            shader_sig: None,
+            last_transition,
             slot0: MediaSlotGpu::empty(),
             slot1: None,
             slot0_has_first_frame: false,
@@ -2636,7 +3932,9 @@ impl WaylandAppSink for AppCore {
             custom_program: None,
             custom_shader_path: None,
             custom_textures: BTreeMap::new(),
+            custom_texture_keys: BTreeMap::new(),
             custom_uniforms: BTreeMap::new(),
+            transient: TransientUniformState::default(),
             last_shader_error: None,
             last_media_error: None,
             transition_program: None,
@@ -3002,6 +4300,7 @@ mod tests {
         let mut spec_textures = BTreeMap::new();
         spec_textures.insert("u_depth".to_string(), mk_spec("depth"));
         spec_textures.insert("u_shared".to_string(), mk_spec("shared"));
+        let mut custom_texture_keys = BTreeMap::new();
 
         let mut custom_uniforms = BTreeMap::new();
         custom_uniforms.insert("u_parallaxStrength".to_string(), UniformValue::Float(0.05));
@@ -3013,6 +4312,7 @@ mod tests {
 
         let removed = prune_shader_bindings(
             &mut custom_textures,
+            &mut custom_texture_keys,
             &mut spec_textures,
             &mut custom_uniforms,
             &mut spec_uniforms,
@@ -3032,6 +4332,7 @@ mod tests {
         let empty = HashSet::new();
         let cleared = prune_shader_bindings(
             &mut custom_textures,
+            &mut custom_texture_keys,
             &mut spec_textures,
             &mut custom_uniforms,
             &mut spec_uniforms,
@@ -3151,6 +4452,23 @@ mod tests {
         ));
     }
 
+    fn write_test_bmp(path: &Path, width: i32, height: i32, pixel_row: &[u8]) {
+        let mut bytes = Vec::with_capacity(54 + pixel_row.len());
+        let file_size = (54 + pixel_row.len()) as u32;
+        bytes.extend_from_slice(b"BM");
+        bytes.extend_from_slice(&file_size.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&54u32.to_le_bytes());
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&24u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 24]);
+        bytes.extend_from_slice(pixel_row);
+        fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn preflight_failure_at_each_stage_destroys_compiled_gl_programs() {
         use glow::HasContext;
@@ -3166,8 +4484,8 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let media_path = dir.join("wall.png");
-        fs::write(&media_path, b"placeholder").unwrap();
+        let media_path = dir.join("wall.bmp");
+        write_test_bmp(&media_path, 1, 1, &[255, 0, 0, 0]);
         let shader_path = dir.join("valid.frag");
         fs::write(
             &shader_path,
@@ -3186,7 +4504,8 @@ mod tests {
         let run_case = |tx: &TxParams| -> Vec<glow::Program> {
             let mut prepared = Vec::new();
             let mut compiled_handles = Vec::new();
-            let pre = resolve_preflight_inputs(tx, "DP-1", 1, &spec, true).unwrap();
+            let pre =
+                resolve_preflight_inputs(tx, "DP-1", 1, &spec, true, 8192, 33_554_432).unwrap();
             let mut slot = None;
             let res = stage_output_transaction(
                 tx,
@@ -3279,6 +4598,7 @@ mod tests {
         let mut pool = TexturePool::new();
         let mut custom_program = None;
         let mut custom_textures = BTreeMap::new();
+        let mut custom_texture_keys = BTreeMap::new();
         let mut spec_textures = BTreeMap::new();
         let mut custom_uniforms = BTreeMap::new();
         let mut spec_uniforms = BTreeMap::new();
@@ -3295,6 +4615,7 @@ vec4 wallpaper(vec2 uv) {
             src_v1,
             &mut custom_program,
             &mut custom_textures,
+            &mut custom_texture_keys,
             &mut spec_textures,
             &mut custom_uniforms,
             &mut spec_uniforms,
@@ -3309,9 +4630,12 @@ vec4 wallpaper(vec2 uv) {
             flip_y: false,
             fingerprint: Default::default(),
         };
-        let depth_id = pool.insert_rgba(&gl, key, 2, 2, &[100; 16]).unwrap();
+        let depth_id = pool
+            .insert_rgba(&gl, key.clone(), 2, 2, &[100; 16])
+            .unwrap();
         let depth_gl_handle = pool.texture_info(depth_id).unwrap().0;
         custom_textures.insert("u_depth".to_string(), depth_id);
+        custom_texture_keys.insert("u_depth".to_string(), key);
         spec_textures.insert(
             "u_depth".to_string(),
             TextureSpec {
@@ -3327,18 +4651,21 @@ vec4 wallpaper(vec2 uv) {
 
         // Failed hot reload must leave active program and bindings untouched.
         let broken_src = "vec4 wallpaper(vec2 uv) { return missing_fn(uv); }";
-        assert!(
-            reload_shader_into_bindings(
-                &gl,
-                broken_src,
-                &mut custom_program,
-                &mut custom_textures,
-                &mut spec_textures,
-                &mut custom_uniforms,
-                &mut spec_uniforms,
-                &mut pool,
-            )
-            .is_err()
+        let err = reload_shader_into_bindings(
+            &gl,
+            broken_src,
+            &mut custom_program,
+            &mut custom_textures,
+            &mut custom_texture_keys,
+            &mut spec_textures,
+            &mut custom_uniforms,
+            &mut spec_uniforms,
+            &mut pool,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error_code_of(&err, IpcErrorCode::InvalidInput),
+            IpcErrorCode::ShaderCompile
         );
         assert_eq!(pool.len(), 1);
         assert!(custom_textures.contains_key("u_depth"));
@@ -3357,6 +4684,7 @@ vec4 wallpaper(vec2 uv) {
             src_v2,
             &mut custom_program,
             &mut custom_textures,
+            &mut custom_texture_keys,
             &mut spec_textures,
             &mut custom_uniforms,
             &mut spec_uniforms,
@@ -3366,6 +4694,7 @@ vec4 wallpaper(vec2 uv) {
 
         assert_eq!(pool.len(), 0);
         assert!(!custom_textures.contains_key("u_depth"));
+        assert!(!custom_texture_keys.contains_key("u_depth"));
         assert!(!spec_textures.contains_key("u_depth"));
         assert!(custom_uniforms.contains_key("u_strength"));
         assert!(!unsafe { gl.is_texture(depth_gl_handle) });
@@ -3374,6 +4703,340 @@ vec4 wallpaper(vec2 uv) {
             prog.destroy(&gl);
         }
         pool.destroy(&gl);
+    }
+
+    #[test]
+    fn preflight_error_codes_cover_contract_taxonomy() {
+        let dir = std::env::temp_dir().join(format!("glwall-codes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let txt = dir.join("readme.txt");
+        fs::write(&txt, b"hello").unwrap();
+        let huge = dir.join("huge.bmp");
+        write_test_bmp(&huge, 16384, 4, &[0u8; 4]);
+        let bad_shader = dir.join("broken.frag");
+        fs::write(&bad_shader, "broken { glsl }").unwrap();
+        let good_shader = dir.join("ok.frag");
+        fs::write(
+            &good_shader,
+            "uniform float u_mix;\nvec4 wallpaper(vec2 uv) { return sampleWallpaper(uv) * u_mix; }\n",
+        )
+        .unwrap();
+
+        let spec = OutputSpec::default();
+        let (media_tx, _) = calloop::channel::channel::<MediaEvent>();
+        let egl = crate::gpu::egl::EglState::new_test_pbuffer(8, 8).unwrap();
+        let gl = egl.create_glow_context().unwrap();
+
+        // MissingSource
+        let err_missing = resolve_preflight_inputs(
+            &TxParams {
+                output: "DP-1".to_string(),
+                media: Some(ApplyMedia {
+                    target: dir.join("missing.png").to_string_lossy().to_string(),
+                    fit: None,
+                    fps: None,
+                    hwaccel: None,
+                }),
+                ..Default::default()
+            },
+            "DP-1",
+            1,
+            &spec,
+            false,
+            8192,
+            33_554_432,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error_code_of(&err_missing, IpcErrorCode::InvalidInput),
+            IpcErrorCode::MissingSource
+        );
+
+        // UnsupportedMedia
+        let err_unsup = resolve_preflight_inputs(
+            &TxParams {
+                output: "DP-1".to_string(),
+                media: Some(ApplyMedia {
+                    target: txt.to_string_lossy().to_string(),
+                    fit: None,
+                    fps: None,
+                    hwaccel: None,
+                }),
+                ..Default::default()
+            },
+            "DP-1",
+            1,
+            &spec,
+            false,
+            8192,
+            33_554_432,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error_code_of(&err_unsup, IpcErrorCode::InvalidInput),
+            IpcErrorCode::UnsupportedMedia
+        );
+
+        // ResourceLimit
+        let err_limit = resolve_preflight_inputs(
+            &TxParams {
+                output: "DP-1".to_string(),
+                media: Some(ApplyMedia {
+                    target: huge.to_string_lossy().to_string(),
+                    fit: None,
+                    fps: None,
+                    hwaccel: None,
+                }),
+                ..Default::default()
+            },
+            "DP-1",
+            1,
+            &spec,
+            false,
+            8192,
+            33_554_432,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error_code_of(&err_limit, IpcErrorCode::InvalidInput),
+            IpcErrorCode::ResourceLimit
+        );
+
+        // RevisionConflict
+        let err_rev = resolve_preflight_inputs(
+            &TxParams {
+                output: "DP-1".to_string(),
+                revision: Some(1),
+                ..Default::default()
+            },
+            "DP-1",
+            3,
+            &spec,
+            false,
+            8192,
+            33_554_432,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error_code_of(&err_rev, IpcErrorCode::InvalidInput),
+            IpcErrorCode::RevisionConflict
+        );
+
+        // InvalidInput (non-finite params)
+        let err_nan = resolve_preflight_inputs(
+            &TxParams {
+                output: "DP-1".to_string(),
+                params: Some([f32::NAN, 0.0, 0.0, 0.0]),
+                ..Default::default()
+            },
+            "DP-1",
+            0,
+            &spec,
+            false,
+            8192,
+            33_554_432,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error_code_of(&err_nan, IpcErrorCode::RenderFailed),
+            IpcErrorCode::InvalidInput
+        );
+
+        // ShaderCompile
+        let pre_sh = resolve_preflight_inputs(
+            &TxParams {
+                output: "DP-1".to_string(),
+                shader: Some(bad_shader.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+            "DP-1",
+            0,
+            &spec,
+            false,
+            8192,
+            33_554_432,
+        )
+        .unwrap();
+        let mut slot = None;
+        let err_compile = stage_output_transaction(
+            &TxParams::default(),
+            &pre_sh,
+            "DP-1",
+            0,
+            &spec,
+            None,
+            false,
+            None,
+            &media_tx,
+            &mut slot,
+            |src| GlProgram::compile(&gl, src),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error_code_of(&err_compile, IpcErrorCode::InvalidInput),
+            IpcErrorCode::ShaderCompile
+        );
+
+        // TypeMismatch
+        let mut bad_u = BTreeMap::new();
+        bad_u.insert("u_mix".to_string(), UniformValue::Bool(true));
+        let tx_u = TxParams {
+            output: "DP-1".to_string(),
+            shader: Some(good_shader.to_string_lossy().to_string()),
+            uniforms: bad_u,
+            ..Default::default()
+        };
+        let pre_u =
+            resolve_preflight_inputs(&tx_u, "DP-1", 0, &spec, false, 8192, 33_554_432).unwrap();
+        let mut slot2 = None;
+        let err_type = stage_output_transaction(
+            &tx_u,
+            &pre_u,
+            "DP-1",
+            0,
+            &spec,
+            None,
+            false,
+            None,
+            &media_tx,
+            &mut slot2,
+            |src| GlProgram::compile(&gl, src),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error_code_of(&err_type, IpcErrorCode::InvalidInput),
+            IpcErrorCode::TypeMismatch
+        );
+        if let Some(prep) = slot2 {
+            prep.destroy_staged(Some(&gl));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transient_uniform_state_overlay_merge_prune_and_clear() {
+        let mut base = BTreeMap::new();
+        base.insert("u_a".to_string(), UniformValue::Float(1.0));
+        base.insert("u_b".to_string(), UniformValue::Int(2));
+
+        let mut st = TransientUniformState {
+            session: "cursor".to_string(),
+            last_seq: 1,
+            pending_overlay: Some({
+                let mut m = BTreeMap::new();
+                m.insert("u_a".to_string(), UniformValue::Float(0.25));
+                m.insert("u_removed".to_string(), UniformValue::Bool(true));
+                m
+            }),
+            active_overlay: BTreeMap::new(),
+        };
+
+        let eff = effective_uniforms_with_overlay(&base, st.current_overlay());
+        assert_eq!(eff.get("u_a"), Some(&UniformValue::Float(0.25)));
+        assert_eq!(eff.get("u_b"), Some(&UniformValue::Int(2)));
+
+        let mut allowed = HashSet::new();
+        allowed.insert("u_a".to_string());
+        st.prune(&allowed);
+        assert!(!st.current_overlay().contains_key("u_removed"));
+        st.consume_pending();
+        assert!(st.pending_overlay.is_none());
+        assert_eq!(
+            st.active_overlay.get("u_a"),
+            Some(&UniformValue::Float(0.25))
+        );
+
+        assert!(st.clear());
+        assert!(st.session.is_empty());
+        assert_eq!(st.last_seq, 0);
+        assert!(st.active_overlay.is_empty());
+    }
+
+    #[test]
+    fn idempotent_fingerprint_matches_identical_retry_and_rejects_drift() {
+        let dir = std::env::temp_dir().join(format!("glwall-idemp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let bmp = dir.join("wall.bmp");
+        write_test_bmp(&bmp, 1, 1, &[10, 20, 30, 0]);
+        let sh = dir.join("fx.frag");
+        fs::write(&sh, "uniform float u_gain;\nvec4 wallpaper(vec2 uv) { return sampleWallpaper(uv) * u_gain; }\n").unwrap();
+
+        let mut base_spec = OutputSpec::default();
+        let bmp_str = bmp.to_string_lossy().to_string();
+        let sh_str = sh.to_string_lossy().to_string();
+        base_spec.target = Some(bmp_str.clone());
+        base_spec.shader = Some(sh_str.clone());
+        base_spec
+            .uniforms
+            .insert("u_gain".to_string(), UniformValue::Float(1.5));
+
+        let current_fp = EffectiveSpecFingerprint {
+            target: normalize_optional_path(Some(&bmp_str)),
+            target_sig: file_stat_sig(&bmp),
+            fit: base_spec.fit,
+            fps_bits: base_spec.fps.map(norm_f32_bits),
+            hwaccel: base_spec.hwaccel,
+            shader: normalize_optional_path(Some(&sh_str)),
+            shader_sig: file_stat_sig(&sh),
+            transition: base_spec.transition.clone(),
+            duration_ms: base_spec.duration_ms,
+            params_bits: base_spec.params.map(norm_f32_bits),
+            textures: BTreeMap::new(),
+            uniforms: base_spec
+                .uniforms
+                .iter()
+                .map(|(k, v)| (k.clone(), UniformFingerprint::from(v)))
+                .collect(),
+        };
+
+        let retry_tx = TxParams {
+            output: "DP-1".to_string(),
+            revision: Some(4),
+            media: Some(ApplyMedia {
+                target: bmp_str.clone(),
+                fit: None,
+                fps: None,
+                hwaccel: None,
+            }),
+            shader: Some(sh_str.clone()),
+            uniforms: base_spec.uniforms.clone(),
+            ..Default::default()
+        };
+        let pre_same =
+            resolve_preflight_inputs(&retry_tx, "DP-1", 4, &base_spec, true, 8192, 33_554_432)
+                .unwrap();
+        assert_eq!(
+            fingerprint_for_tx(&retry_tx, &pre_same, &current_fp),
+            current_fp
+        );
+
+        let mut diff_uniforms = base_spec.uniforms.clone();
+        diff_uniforms.insert("u_gain".to_string(), UniformValue::Float(2.0));
+        let conflict_tx = TxParams {
+            output: "DP-1".to_string(),
+            revision: Some(4),
+            uniforms: diff_uniforms,
+            ..Default::default()
+        };
+        let pre_diff =
+            resolve_preflight_inputs(&conflict_tx, "DP-1", 4, &base_spec, true, 8192, 33_554_432)
+                .unwrap();
+        assert_ne!(
+            fingerprint_for_tx(&conflict_tx, &pre_diff, &current_fp),
+            current_fp
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

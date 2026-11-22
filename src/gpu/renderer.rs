@@ -525,6 +525,10 @@ impl<T> TexturePoolCore<T> {
         }
     }
 
+    pub fn contains_key(&self, key: &TextureKey) -> bool {
+        self.by_key.contains_key(key)
+    }
+
     pub fn acquire(&mut self, key: &TextureKey) -> Option<TextureId> {
         let id = *self.by_key.get(key)?;
         if let Some(entry) = self.entries.get_mut(&id) {
@@ -601,6 +605,10 @@ impl TexturePool {
         }
     }
 
+    pub fn contains_key(&self, key: &TextureKey) -> bool {
+        self.core.contains_key(key)
+    }
+
     pub fn acquire(&mut self, key: &TextureKey) -> Option<TextureId> {
         self.core.acquire(key)
     }
@@ -638,6 +646,14 @@ impl TexturePool {
 
     pub fn len(&self) -> usize {
         self.core.len()
+    }
+
+    pub fn estimated_gpu_bytes(&self) -> u64 {
+        self.core
+            .entries
+            .values()
+            .map(|e| u64::from(e.width) * u64::from(e.height) * 4)
+            .sum()
     }
 
     pub fn destroy(mut self, gl: &glow::Context) {
@@ -1024,6 +1040,26 @@ impl MediaSlotGpu {
         Ok(())
     }
 
+    pub fn estimated_gpu_bytes(&self) -> u64 {
+        match self.kind {
+            SlotMediaKind::None => 0,
+            SlotMediaKind::Rgba => u64::from(self.width) * u64::from(self.height) * 4,
+            SlotMediaKind::Nv12 => {
+                let y_uv = (u64::from(self.width) * u64::from(self.height) * 3) / 2;
+                let cuda_mult = if self.cuda_textures.is_some() && self.cuda_staging.is_some() {
+                    2
+                } else {
+                    1
+                };
+                let pbo_bytes = self
+                    .pbo_ring
+                    .as_ref()
+                    .map_or(0, |r| 2 * (r.y_bytes as u64 + r.uv_bytes as u64));
+                y_uv * cuda_mult + pbo_bytes
+            }
+        }
+    }
+
     fn clear_rgba(&mut self, gl: &glow::Context) {
         if let Some(tex) = self.rgba_tex.take() {
             tex.destroy(gl);
@@ -1137,6 +1173,7 @@ pub struct DrawParams<'a> {
     pub in_transition: bool,
     pub custom_textures: &'a BTreeMap<String, TextureId>,
     pub custom_uniforms: &'a BTreeMap<String, UniformValue>,
+    pub transient_uniforms: &'a BTreeMap<String, UniformValue>,
 }
 
 pub struct Renderer {
@@ -1146,6 +1183,7 @@ pub struct Renderer {
     passthrough_program: GlProgram,
     resolve_targets: HashMap<String, ResolveTarget>,
     max_texture_units: u32,
+    max_texture_size: u32,
 }
 
 type SlotUniformLocs<'a> = (
@@ -1169,6 +1207,8 @@ impl Renderer {
         let passthrough_program = GlProgram::compile(&gl, BUILTIN_PASSTHROUGH)?;
         let max_texture_units =
             unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_IMAGE_UNITS) }.max(8) as u32;
+        let max_texture_size =
+            unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) }.max(2048) as u32;
 
         Ok(Self {
             gl,
@@ -1177,6 +1217,17 @@ impl Renderer {
             passthrough_program,
             resolve_targets: HashMap::new(),
             max_texture_units,
+            max_texture_size,
+        })
+    }
+
+    pub fn max_texture_size(&self) -> u32 {
+        self.max_texture_size
+    }
+
+    pub fn resolve_target_gpu_bytes(&self, output_name: &str) -> u64 {
+        self.resolve_targets.get(output_name).map_or(0, |t| {
+            u64::from(t.color_tex.width) * u64::from(t.color_tex.height) * 4
         })
     }
 
@@ -1417,7 +1468,11 @@ impl Renderer {
         }
 
         for uniform in &program.user_uniforms {
-            if let Some(value) = params.custom_uniforms.get(&uniform.name) {
+            if let Some(value) = params
+                .transient_uniforms
+                .get(&uniform.name)
+                .or_else(|| params.custom_uniforms.get(&uniform.name))
+            {
                 let _ = upload_uniform(gl, &uniform.location, uniform.utype, value);
             }
         }
@@ -1547,6 +1602,7 @@ mod tests {
             in_transition: false,
             custom_textures: &textures,
             custom_uniforms: &uniforms,
+            transient_uniforms: &BTreeMap::new(),
         };
         renderer.draw(&params, &pool).unwrap();
         let mut pixels = [0u8; 8 * 8 * 4];
@@ -1704,6 +1760,7 @@ mod tests {
                             in_transition,
                             custom_textures: &textures,
                             custom_uniforms: &uniforms,
+                            transient_uniforms: &BTreeMap::new(),
                         };
                         renderer.draw(&params, &pool).unwrap();
                         let mut pixels = [0u8; 8 * 8 * 4];
@@ -1918,6 +1975,7 @@ mod tests {
                 in_transition: true,
                 custom_textures: &custom_textures,
                 custom_uniforms: &custom_uniforms,
+                transient_uniforms: &BTreeMap::new(),
             };
             renderer.draw(&params, &pool).unwrap();
 

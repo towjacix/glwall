@@ -42,6 +42,100 @@ pub struct ApplyTransition {
     pub duration_ms: Option<u32>,
 }
 
+fn default_wildcard_output() -> String {
+    "*".to_string()
+}
+
+fn default_batch_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum IpcErrorCode {
+    InvalidInput,
+    UnsupportedMedia,
+    MissingSource,
+    ShaderCompile,
+    TypeMismatch,
+    RevisionConflict,
+    ResourceLimit,
+    RenderFailed,
+    Timeout,
+    Unavailable,
+    Canceled,
+}
+
+impl IpcErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidInput => "INVALID_INPUT",
+            Self::UnsupportedMedia => "UNSUPPORTED_MEDIA",
+            Self::MissingSource => "MISSING_SOURCE",
+            Self::ShaderCompile => "SHADER_COMPILE",
+            Self::TypeMismatch => "TYPE_MISMATCH",
+            Self::RevisionConflict => "REVISION_CONFLICT",
+            Self::ResourceLimit => "RESOURCE_LIMIT",
+            Self::RenderFailed => "RENDER_FAILED",
+            Self::Timeout => "TIMEOUT",
+            Self::Unavailable => "UNAVAILABLE",
+            Self::Canceled => "CANCELED",
+        }
+    }
+}
+
+impl std::fmt::Display for IpcErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug)]
+pub struct CodedError {
+    pub code: IpcErrorCode,
+    pub message: String,
+}
+
+impl std::fmt::Display for CodedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CodedError {}
+
+pub fn coded_err(code: IpcErrorCode, msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(CodedError {
+        code,
+        message: msg.into(),
+    })
+}
+
+pub fn error_code_of(err: &anyhow::Error, fallback: IpcErrorCode) -> IpcErrorCode {
+    for cause in err.chain() {
+        if let Some(coded) = cause.downcast_ref::<CodedError>() {
+            return coded.code;
+        }
+    }
+    fallback
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BatchOutputApply {
+    pub output: String,
+    #[serde(default)]
+    pub revision: Option<u64>,
+    #[serde(default)]
+    pub media: Option<ApplyMedia>,
+    #[serde(default)]
+    pub shader: Option<String>,
+    #[serde(default)]
+    pub textures: BTreeMap<String, Option<TextureSpec>>,
+    #[serde(default)]
+    pub uniforms: BTreeMap<String, UniformValue>,
+    #[serde(default)]
+    pub transition: Option<ApplyTransition>,
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum IpcRequest {
@@ -104,6 +198,24 @@ pub enum IpcRequest {
         #[serde(default)]
         wait_commit: bool,
     },
+    UniformsTransient {
+        #[serde(default = "default_wildcard_output")]
+        output: String,
+        session: String,
+        seq: u64,
+        #[serde(default)]
+        values: BTreeMap<String, UniformValue>,
+        #[serde(default)]
+        clear: bool,
+    },
+    ApplyBatch {
+        #[serde(default = "default_batch_version")]
+        version: u32,
+        group_id: String,
+        targets: Vec<BatchOutputApply>,
+        #[serde(default)]
+        wait_commit: bool,
+    },
     Subscribe {
         #[serde(default)]
         output: Option<String>,
@@ -132,6 +244,8 @@ pub enum IpcRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IpcResponse {
     pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub code: Option<IpcErrorCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -142,6 +256,7 @@ impl IpcResponse {
     pub fn ok_msg(msg: impl Into<String>) -> Self {
         Self {
             ok: true,
+            code: None,
             message: Some(msg.into()),
             data: None,
         }
@@ -150,17 +265,27 @@ impl IpcResponse {
     pub fn ok_data(data: Value) -> Self {
         Self {
             ok: true,
+            code: None,
             message: None,
             data: Some(data),
         }
     }
 
     pub fn err(msg: impl Into<String>) -> Self {
+        Self::err_coded(IpcErrorCode::InvalidInput, msg)
+    }
+
+    pub fn err_coded(code: IpcErrorCode, msg: impl Into<String>) -> Self {
         Self {
             ok: false,
+            code: Some(code),
             message: Some(msg.into()),
             data: None,
         }
+    }
+
+    pub fn from_anyhow(err: &anyhow::Error, fallback: IpcErrorCode) -> Self {
+        Self::err_coded(error_code_of(err, fallback), format!("{err:#}"))
     }
 }
 
@@ -180,11 +305,15 @@ pub enum IpcEvent {
         output: String,
         revision: u64,
         ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        code: Option<IpcErrorCode>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
     MediaError {
         output: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        code: Option<IpcErrorCode>,
         message: String,
     },
     OutputAdded {
@@ -1235,6 +1364,7 @@ mod tests {
         let large_msg = "x".repeat(400_000);
         let ev = IpcEvent::MediaError {
             output: "DP-1".into(),
+            code: Some(IpcErrorCode::RenderFailed),
             message: large_msg,
         };
         hub.broadcast_event(&ev);

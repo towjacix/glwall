@@ -145,6 +145,18 @@ fn default_true() -> bool {
     true
 }
 
+fn default_max_texture_dimension() -> u32 {
+    8192
+}
+
+fn default_max_image_pixels() -> u64 {
+    33_554_432
+}
+
+fn default_max_gpu_texture_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -156,6 +168,12 @@ pub struct Config {
     pub persist_state: bool,
     pub fps_cap: Option<f32>,
     pub hwaccel: HwAccel,
+    #[serde(default = "default_max_texture_dimension")]
+    pub max_texture_dimension: u32,
+    #[serde(default = "default_max_image_pixels")]
+    pub max_image_pixels: u64,
+    #[serde(default = "default_max_gpu_texture_bytes")]
+    pub max_gpu_texture_bytes: u64,
     pub outputs: HashMap<String, OutputConfig>,
 }
 
@@ -169,6 +187,9 @@ impl Default for Config {
             persist_state: true,
             fps_cap: None,
             hwaccel: HwAccel::Auto,
+            max_texture_dimension: default_max_texture_dimension(),
+            max_image_pixels: default_max_image_pixels(),
+            max_gpu_texture_bytes: default_max_gpu_texture_bytes(),
             outputs: HashMap::new(),
         }
     }

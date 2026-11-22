@@ -215,6 +215,33 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 print_simple_response(resp)
             }
         }
+        Commands::UniformTransient {
+            assignments,
+            output,
+            session,
+            seq,
+            clear,
+        } => {
+            if !clear && assignments.is_empty() {
+                bail!("provide at least one NAME=VALUE assignment or pass --clear");
+            }
+            let mut values = BTreeMap::new();
+            for spec in &assignments {
+                let (name, value) = UniformValue::parse_cli(spec)?;
+                values.insert(name, value);
+            }
+            let resp = send_request(
+                &socket_path,
+                &IpcRequest::UniformsTransient {
+                    output,
+                    session,
+                    seq,
+                    values,
+                    clear,
+                },
+            )?;
+            print_simple_response(resp)
+        }
         Commands::Texture {
             name,
             path,
@@ -385,6 +412,9 @@ fn print_simple_response(resp: IpcResponse) -> Result<ExitCode> {
         let msg = resp
             .message
             .unwrap_or_else(|| "request rejected".to_string());
+        if let Some(code) = resp.code {
+            bail!("[{code}] {msg}");
+        }
         bail!("{msg}");
     }
     if let Some(msg) = resp.message {
@@ -400,6 +430,9 @@ fn print_data_response(resp: IpcResponse, json_mode: bool) -> Result<ExitCode> {
         let msg = resp
             .message
             .unwrap_or_else(|| "request rejected".to_string());
+        if let Some(code) = resp.code {
+            bail!("[{code}] {msg}");
+        }
         bail!("{msg}");
     }
     if let Some(data) = resp.data {

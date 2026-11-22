@@ -3,6 +3,7 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_ulong, c_void};
 use std::path::Path;
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -234,6 +235,7 @@ impl Api {
 // loaded libraries alive for all plugin callbacks and retained samples.
 static API: OnceLock<std::result::Result<Arc<Api>, String>> = OnceLock::new();
 static PIPELINE_LOCK: Mutex<usize> = Mutex::new(0);
+static ACTIVE_PIPELINES: AtomicUsize = AtomicUsize::new(0);
 
 fn api() -> Result<Arc<Api>> {
     API.get_or_init(|| Api::load().map(Arc::new).map_err(|e| format!("{e:#}")))
@@ -265,6 +267,11 @@ pub fn reclaim_idle_resources() {
     unsafe {
         libc::malloc_trim(0);
     }
+}
+
+/// Returns the number of active CUDA GStreamer decoder pipelines without locking.
+pub fn active_pipeline_count() -> usize {
+    ACTIVE_PIPELINES.load(Ordering::Acquire)
 }
 
 #[cfg(test)]
@@ -550,6 +557,7 @@ impl CudaDecoder {
         {
             let mut active = PIPELINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             *active += 1;
+            ACTIVE_PIPELINES.store(*active, Ordering::Release);
         }
         let decoder = Self {
             api,
@@ -635,6 +643,7 @@ impl Drop for CudaDecoder {
         {
             let mut active = PIPELINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             *active = active.saturating_sub(1);
+            ACTIVE_PIPELINES.store(*active, Ordering::Release);
             if *active == 0 {
                 cleanup_idle_locked(&self.api);
             }

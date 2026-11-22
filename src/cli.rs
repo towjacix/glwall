@@ -139,6 +139,28 @@ pub enum Commands {
         output: String,
     },
 
+    /// Apply ephemeral runtime-only shader uniforms (never persisted)
+    UniformTransient {
+        /// Assignments in NAME=VALUE format
+        assignments: Vec<String>,
+
+        /// Output name or '*' for all outputs
+        #[arg(long, default_value = "*")]
+        output: String,
+
+        /// Sender session identifier for monotonic sequence ordering
+        #[arg(long, default_value = "cli")]
+        session: String,
+
+        /// Monotonic per-session sequence number
+        #[arg(long)]
+        seq: u64,
+
+        /// Clear previously active transient uniforms before applying values
+        #[arg(long)]
+        clear: bool,
+    },
+
     /// Bind or unbind a named auxiliary sampler2D texture
     Texture {
         /// Uniform sampler2D name in the shader (e.g. u_depth)

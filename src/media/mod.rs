@@ -4,7 +4,7 @@ pub mod video;
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -14,6 +14,7 @@ use calloop::channel::Sender;
 
 use crate::config::{ColorSpace, HwAccel};
 use crate::gpu::renderer::TextureKey;
+use crate::ipc::{IpcErrorCode, coded_err, error_code_of};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
@@ -149,9 +150,14 @@ impl FrameMailbox {
     }
 
     pub fn send_error(&self, message: String) {
+        self.send_coded_error(IpcErrorCode::RenderFailed, message);
+    }
+
+    pub fn send_coded_error(&self, code: IpcErrorCode, message: String) {
         let _ = self.sender.send(MediaEvent::Error {
             output: self.output.clone(),
             generation: self.generation,
+            code,
             message,
         });
     }
@@ -179,6 +185,7 @@ pub enum MediaEvent {
     Error {
         output: String,
         generation: u64,
+        code: IpcErrorCode,
         message: String,
     },
     AuxTextureReady {
@@ -189,53 +196,202 @@ pub enum MediaEvent {
     },
     AuxTextureError {
         key: TextureKey,
+        code: IpcErrorCode,
         message: String,
     },
 }
 
-/// Spawns an aux-texture decode on a helper thread. A panic inside the
-/// worker is converted into `AuxTextureError` so the daemon never leaves a
-/// `pending_apply`/`inflight_tex_decodes` entry stuck forever.
-pub fn decode_texture_async(key: TextureKey, sender: Sender<MediaEvent>) {
-    let spawn = std::thread::Builder::new()
-        .name("glwall-tex".to_string())
-        .spawn({
-            let key = key.clone();
-            let sender = sender.clone();
-            move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    static_img::decode_rgba_image(&key.path, key.flip_y)
-                }));
-                match result {
-                    Ok(Ok((width, height, pixels))) => {
-                        let _ = sender.send(MediaEvent::AuxTextureReady {
-                            key,
-                            width,
-                            height,
-                            pixels,
-                        });
+pub const AUX_DECODE_WORKERS: usize = 2;
+pub const MAX_AUX_DECODE_QUEUE: usize = 16;
+
+struct AuxDecodeTask {
+    key: TextureKey,
+    sender: Sender<MediaEvent>,
+}
+
+type AuxDecodeFn = dyn Fn(&TextureKey) -> Result<(u32, u32, Vec<u8>)> + Send + Sync;
+
+struct AuxPoolState {
+    queue: VecDeque<AuxDecodeTask>,
+    workers_spawned: usize,
+    active_workers: usize,
+    shutdown: bool,
+}
+
+struct AuxDecodePool {
+    max_workers: usize,
+    max_queue: usize,
+    decoder: Arc<AuxDecodeFn>,
+    state: Mutex<AuxPoolState>,
+    cv: Condvar,
+    active_count: AtomicUsize,
+    queued_count: AtomicUsize,
+}
+
+impl AuxDecodePool {
+    fn new(max_workers: usize, max_queue: usize, decoder: Arc<AuxDecodeFn>) -> Self {
+        Self {
+            max_workers: max_workers.max(1),
+            max_queue: max_queue.max(1),
+            decoder,
+            state: Mutex::new(AuxPoolState {
+                queue: VecDeque::new(),
+                workers_spawned: 0,
+                active_workers: 0,
+                shutdown: false,
+            }),
+            cv: Condvar::new(),
+            active_count: AtomicUsize::new(0),
+            queued_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn stats(&self) -> (usize, usize) {
+        (
+            self.active_count.load(Ordering::Acquire),
+            self.queued_count.load(Ordering::Acquire),
+        )
+    }
+
+    fn has_capacity(&self, additional: usize) -> bool {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.queue.len() + additional <= self.max_queue
+    }
+
+    fn enqueue(self: &Arc<Self>, key: TextureKey, sender: Sender<MediaEvent>) -> Result<()> {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.queue.len() >= self.max_queue {
+            return Err(coded_err(
+                IpcErrorCode::ResourceLimit,
+                format!(
+                    "auxiliary texture decode queue full ({}/{})",
+                    guard.queue.len(),
+                    self.max_queue
+                ),
+            ));
+        }
+        guard.queue.push_back(AuxDecodeTask { key, sender });
+        self.queued_count
+            .store(guard.queue.len(), Ordering::Release);
+
+        let should_spawn = guard.workers_spawned < self.max_workers
+            && guard.workers_spawned < guard.active_workers + guard.queue.len();
+        if should_spawn {
+            let worker_idx = guard.workers_spawned;
+            let pool = Arc::clone(self);
+            match std::thread::Builder::new()
+                .name(format!("glwall-tex-{worker_idx}"))
+                .spawn(move || {
+                    loop {
+                        let task = {
+                            let mut g = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+                            while g.queue.is_empty() && !g.shutdown {
+                                g = pool.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                            }
+                            if g.shutdown && g.queue.is_empty() {
+                                return;
+                            }
+                            let task = g.queue.pop_front().unwrap();
+                            g.active_workers += 1;
+                            pool.queued_count.store(g.queue.len(), Ordering::Release);
+                            pool.active_count.store(g.active_workers, Ordering::Release);
+                            task
+                        };
+
+                        let key_for_decode = task.key.clone();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            (pool.decoder)(&key_for_decode)
+                        }));
+                        match result {
+                            Ok(Ok((width, height, pixels))) => {
+                                let _ = task.sender.send(MediaEvent::AuxTextureReady {
+                                    key: task.key,
+                                    width,
+                                    height,
+                                    pixels,
+                                });
+                            }
+                            Ok(Err(err)) => {
+                                let code = error_code_of(&err, IpcErrorCode::UnsupportedMedia);
+                                let _ = task.sender.send(MediaEvent::AuxTextureError {
+                                    key: task.key,
+                                    code,
+                                    message: format!("{err:#}"),
+                                });
+                            }
+                            Err(_) => {
+                                let _ = task.sender.send(MediaEvent::AuxTextureError {
+                                    key: task.key,
+                                    code: IpcErrorCode::RenderFailed,
+                                    message: "auxiliary texture decoder panicked".to_string(),
+                                });
+                            }
+                        }
+
+                        {
+                            let mut g = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+                            g.active_workers = g.active_workers.saturating_sub(1);
+                            pool.active_count.store(g.active_workers, Ordering::Release);
+                        }
                     }
-                    Ok(Err(err)) => {
-                        let _ = sender.send(MediaEvent::AuxTextureError {
-                            key,
-                            message: format!("{err}"),
-                        });
-                    }
-                    Err(_) => {
-                        let _ = sender.send(MediaEvent::AuxTextureError {
-                            key,
-                            message: "aux texture decode panicked".to_string(),
-                        });
+                }) {
+                Ok(_) => {
+                    guard.workers_spawned += 1;
+                }
+                Err(err) => {
+                    if guard.workers_spawned == 0 {
+                        let removed = guard.queue.pop_back();
+                        self.queued_count
+                            .store(guard.queue.len(), Ordering::Release);
+                        drop(removed);
+                        return Err(coded_err(
+                            IpcErrorCode::Unavailable,
+                            format!("failed to spawn auxiliary texture worker: {err}"),
+                        ));
                     }
                 }
             }
-        });
-    if spawn.is_err() {
-        let _ = sender.send(MediaEvent::AuxTextureError {
-            key,
-            message: "failed to spawn aux texture decode thread".to_string(),
-        });
+        }
+        self.cv.notify_one();
+        Ok(())
     }
+
+    #[cfg(test)]
+    fn shutdown(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.shutdown = true;
+        self.cv.notify_all();
+    }
+}
+
+static AUX_POOL: OnceLock<Arc<AuxDecodePool>> = OnceLock::new();
+
+fn global_aux_pool() -> &'static Arc<AuxDecodePool> {
+    AUX_POOL.get_or_init(|| {
+        Arc::new(AuxDecodePool::new(
+            AUX_DECODE_WORKERS,
+            MAX_AUX_DECODE_QUEUE,
+            Arc::new(|key: &TextureKey| static_img::decode_rgba_image(&key.path, key.flip_y)),
+        ))
+    })
+}
+
+/// Checks whether the global auxiliary decode queue can accept `additional` jobs.
+pub fn aux_decode_has_capacity(additional: usize) -> bool {
+    global_aux_pool().has_capacity(additional)
+}
+
+/// Returns `(active_aux_workers, queued_aux_decodes)` without blocking workers.
+pub fn aux_decode_stats() -> (usize, usize) {
+    match AUX_POOL.get() {
+        Some(pool) => pool.stats(),
+        None => (0, 0),
+    }
+}
+
+/// Submits an aux-texture decode to the bounded 2-worker pool.
+pub fn decode_texture_async(key: TextureKey, sender: Sender<MediaEvent>) -> Result<()> {
+    global_aux_pool().enqueue(key, sender)
 }
 
 #[derive(Debug)]
@@ -465,6 +621,28 @@ pub fn wait_for_reaped_workers() {
     }
 }
 
+static ACTIVE_MEDIA_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns the number of live primary media decode worker threads.
+pub fn active_media_workers() -> usize {
+    ACTIVE_MEDIA_WORKERS.load(Ordering::Acquire)
+}
+
+struct ActiveMediaWorkerGuard;
+
+impl ActiveMediaWorkerGuard {
+    fn enter() -> Self {
+        ACTIVE_MEDIA_WORKERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for ActiveMediaWorkerGuard {
+    fn drop(&mut self) {
+        ACTIVE_MEDIA_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub struct MediaJob {
     pub generation: u64,
     pub kind: MediaKind,
@@ -507,6 +685,7 @@ impl MediaJob {
                 // and slot1/prev_job resources stuck forever.
 
                 move || {
+                    let _worker_guard = ActiveMediaWorkerGuard::enter();
                     let run = || match kind {
                         MediaKind::ProceduralShader => {}
                         MediaKind::StaticImage => {
@@ -549,6 +728,7 @@ impl MediaJob {
                         let _ = panic_sender.send(MediaEvent::Error {
                             output: panic_output,
                             generation,
+                            code: IpcErrorCode::RenderFailed,
                             message: "media worker panicked".to_string(),
                         });
                     }
@@ -692,5 +872,94 @@ mod tests {
             exited.load(Ordering::Acquire),
             "background reaper did not join worker thread"
         );
+    }
+
+    #[test]
+    fn aux_decode_pool_bounds_concurrency_and_queue_depth() {
+        use crate::gpu::renderer::TextureFingerprint;
+        use crate::gpu::uniforms::{TextureFilter, TextureWrap};
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let d_in_flight = Arc::clone(&in_flight);
+        let d_max = Arc::clone(&max_seen);
+        let d_done = Arc::clone(&completed);
+        let d_gate = Arc::clone(&gate);
+
+        let pool = Arc::new(AuxDecodePool::new(
+            2,
+            4,
+            Arc::new(move |_| {
+                let now = d_in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+                d_max.fetch_max(now, Ordering::AcqRel);
+                let (lock, cv) = &*d_gate;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+                drop(open);
+                d_in_flight.fetch_sub(1, Ordering::AcqRel);
+                d_done.fetch_add(1, Ordering::AcqRel);
+                Ok((1, 1, vec![255, 0, 0, 255]))
+            }),
+        ));
+
+        let (tx, _rx) = calloop::channel::channel::<MediaEvent>();
+        let make_key = |n: usize| TextureKey {
+            path: std::path::PathBuf::from(format!("/tmp/tex-{n}.png")),
+            filter: TextureFilter::Linear,
+            wrap: TextureWrap::ClampToEdge,
+            flip_y: false,
+            fingerprint: TextureFingerprint {
+                size: n as u64,
+                mtime_sec: 0,
+                mtime_nsec: 0,
+                content_hash: n as u64,
+            },
+        };
+
+        pool.enqueue(make_key(0), tx.clone()).unwrap();
+        pool.enqueue(make_key(1), tx.clone()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (in_flight.load(Ordering::Acquire) < 2 || pool.stats().1 > 0)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(in_flight.load(Ordering::Acquire), 2);
+        assert_eq!(pool.stats(), (2, 0));
+
+        for idx in 2..6 {
+            pool.enqueue(make_key(idx), tx.clone()).unwrap();
+        }
+        assert_eq!(pool.stats(), (2, 4));
+        assert!(!pool.has_capacity(1));
+
+        let err = pool.enqueue(make_key(6), tx).unwrap_err();
+        assert_eq!(
+            error_code_of(&err, IpcErrorCode::InvalidInput),
+            IpcErrorCode::ResourceLimit
+        );
+
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+
+        let finish_deadline = Instant::now() + Duration::from_secs(2);
+        while (completed.load(Ordering::Acquire) < 6 || pool.stats() != (0, 0))
+            && Instant::now() < finish_deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(completed.load(Ordering::Acquire), 6);
+        assert_eq!(pool.stats(), (0, 0));
+        assert!(max_seen.load(Ordering::Acquire) <= 2);
+        pool.shutdown();
     }
 }
