@@ -1,6 +1,6 @@
 # Maintainer: towjacix <manhp7658@gmail.com>
 pkgname=glwall-bin
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="Standalone Wayland OpenGL ES 3.0 / EGL live & custom-shader wallpaper daemon"
 arch=('x86_64')
