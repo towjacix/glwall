@@ -2,12 +2,14 @@ pub mod gst_cuda;
 pub mod static_img;
 pub mod video;
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
 use calloop::channel::Sender;
 
 use crate::config::{ColorSpace, HwAccel};
@@ -135,6 +137,15 @@ impl FrameMailbox {
     pub fn recycle(&self, payload: FramePayload) {
         let mut guard = self.inner.lock().unwrap();
         recycle_into(&mut guard, payload);
+    }
+
+    pub fn clear_pending(&self) {
+        self.notify_queued.store(false, Ordering::Release);
+        let mut guard = self.inner.lock().unwrap();
+        guard.pending = None;
+        guard.spare_rgba = Vec::new();
+        guard.spare_y = Vec::new();
+        guard.spare_uv = Vec::new();
     }
 
     pub fn send_error(&self, message: String) {
@@ -360,6 +371,100 @@ impl WorkerControl {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_SPAWN_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub fn set_force_spawn_fail(fail: bool) {
+    FORCE_SPAWN_FAIL.with(|f| f.set(fail));
+}
+
+struct ReaperState {
+    queue: VecDeque<JoinHandle<()>>,
+    in_flight: usize,
+}
+
+struct WorkerReaper {
+    state: Mutex<ReaperState>,
+    cv: Condvar,
+    done_cv: Condvar,
+}
+
+static REAPER: OnceLock<WorkerReaper> = OnceLock::new();
+
+impl WorkerReaper {
+    fn global() -> &'static Self {
+        REAPER.get_or_init(|| {
+            let reaper = Self {
+                state: Mutex::new(ReaperState {
+                    queue: VecDeque::new(),
+                    in_flight: 0,
+                }),
+                cv: Condvar::new(),
+                done_cv: Condvar::new(),
+            };
+            let _ = std::thread::Builder::new()
+                .name("glwall-reaper".to_string())
+                .spawn(|| {
+                    let me = REAPER.wait();
+                    loop {
+                        let handle = {
+                            let mut guard = me.state.lock().unwrap_or_else(|e| e.into_inner());
+                            while guard.queue.is_empty() {
+                                guard = me.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+                            }
+                            guard.queue.pop_front()
+                        };
+                        if let Some(h) = handle {
+                            let _ = h.join();
+                            let idle_now = {
+                                let mut guard = me.state.lock().unwrap_or_else(|e| e.into_inner());
+                                guard.in_flight = guard.in_flight.saturating_sub(1);
+                                let empty = guard.queue.is_empty() && guard.in_flight == 0;
+                                if empty {
+                                    me.done_cv.notify_all();
+                                }
+                                empty
+                            };
+                            if idle_now {
+                                gst_cuda::reclaim_idle_resources();
+                                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                                unsafe {
+                                    libc::malloc_trim(0);
+                                }
+                            }
+                        }
+                    }
+                });
+            reaper
+        })
+    }
+
+    fn enqueue(&self, handle: JoinHandle<()>) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.in_flight += 1;
+        guard.queue.push_back(handle);
+        self.cv.notify_one();
+    }
+}
+
+/// Blocks until every worker thread handed to the background reaper has
+/// finished joining (primarily for clean daemon shutdown and tests).
+pub fn wait_for_reaped_workers() {
+    let Some(reaper) = REAPER.get() else {
+        return;
+    };
+    let mut guard = reaper.state.lock().unwrap_or_else(|e| e.into_inner());
+    while !guard.queue.is_empty() || guard.in_flight > 0 {
+        guard = reaper
+            .done_cv
+            .wait(guard)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+}
+
 pub struct MediaJob {
     pub generation: u64,
     pub kind: MediaKind,
@@ -379,7 +484,12 @@ impl MediaJob {
         fps_cap: Option<f32>,
         initially_paused: bool,
         sender: Sender<MediaEvent>,
-    ) -> Self {
+    ) -> Result<Self> {
+        #[cfg(test)]
+        if FORCE_SPAWN_FAIL.with(|f| f.get()) {
+            anyhow::bail!("injected media worker spawn failure");
+        }
+
         let control = WorkerControl::new(initially_paused);
         let panic_sender = sender.clone();
         let panic_output = output.clone();
@@ -397,7 +507,7 @@ impl MediaJob {
                 // and slot1/prev_job resources stuck forever.
 
                 move || {
-                    let run = move || match kind {
+                    let run = || match kind {
                         MediaKind::ProceduralShader => {}
                         MediaKind::StaticImage => {
                             static_img::run_static(&path_buf, &worker_control, &worker_mailbox);
@@ -442,43 +552,51 @@ impl MediaJob {
                             message: "media worker panicked".to_string(),
                         });
                     }
+                    drop(worker_mailbox);
                 }
             })
-            .ok();
+            .context("failed to spawn media decode worker thread")?;
 
-        Self {
+        Ok(Self {
             generation,
             kind,
             control,
             mailbox,
-            handle,
-        }
+            handle: Some(handle),
+        })
     }
 
     pub fn set_paused(&self, paused: bool) {
         self.control.set_paused(paused);
     }
 
-    pub fn stop(mut self) {
+    fn stop_and_reap(&mut self) {
         self.control.request_stop();
+        self.mailbox.clear_pending();
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                WorkerReaper::global().enqueue(handle);
+            }
         }
+    }
+
+    pub fn stop(mut self) {
+        self.stop_and_reap();
     }
 }
 
 impl Drop for MediaJob {
     fn drop(&mut self) {
-        self.control.request_stop();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        self.stop_and_reap();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn detects_media_kinds_by_extension() {
@@ -503,5 +621,76 @@ mod tests {
             Some(MediaKind::Video)
         );
         assert_eq!(MediaKind::from_path(Path::new("/tmp/readme.txt")), None);
+    }
+
+    #[test]
+    fn media_job_spawn_propagates_error_on_fault_injection() {
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                set_force_spawn_fail(false);
+            }
+        }
+
+        let (tx, _rx) = calloop::channel::channel::<MediaEvent>();
+        set_force_spawn_fail(true);
+        let _guard = ResetGuard;
+
+        let res = MediaJob::spawn(
+            "DP-1".to_string(),
+            1,
+            Path::new("/tmp/missing.jpg"),
+            MediaKind::StaticImage,
+            HwAccel::Auto,
+            None,
+            false,
+            tx,
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn media_job_stop_is_nonblocking_and_reaps_in_background() {
+        let (tx, _rx) = calloop::channel::channel::<MediaEvent>();
+        let control = WorkerControl::new(false);
+        let mailbox = FrameMailbox::new(tx, "DP-1".to_string(), 7);
+        let exited = Arc::new(AtomicBool::new(false));
+
+        let w_ctrl = Arc::clone(&control);
+        let w_exited = Arc::clone(&exited);
+        let handle = std::thread::Builder::new()
+            .name("glwall-test-worker".to_string())
+            .spawn(move || {
+                while !w_ctrl.should_stop() {
+                    if !w_ctrl.interruptible_sleep(Duration::from_millis(20)) {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(250));
+                w_exited.store(true, Ordering::Release);
+            })
+            .unwrap();
+
+        let job = MediaJob {
+            generation: 7,
+            kind: MediaKind::Video,
+            control,
+            mailbox,
+            handle: Some(handle),
+        };
+
+        let start = Instant::now();
+        job.stop();
+        let stop_elapsed = start.elapsed();
+        assert!(
+            stop_elapsed < Duration::from_millis(50),
+            "MediaJob::stop blocked event loop for {stop_elapsed:?}"
+        );
+
+        wait_for_reaped_workers();
+        assert!(
+            exited.load(Ordering::Acquire),
+            "background reaper did not join worker thread"
+        );
     }
 }

@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::slice;
 
 use anyhow::{Result, bail};
@@ -436,22 +438,60 @@ impl OwnedTexture {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TextureId(pub u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct TextureFingerprint {
+    pub size: u64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+    pub content_hash: u64,
+}
+
+impl TextureFingerprint {
+    pub fn from_path(path: &Path) -> Self {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return Self::default();
+        };
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        if let Ok(mut file) = std::fs::File::open(path) {
+            let mut buf = [0u8; 64 * 1024];
+            while let Ok(n) = file.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                for &b in &buf[..n] {
+                    hash ^= u64::from(b);
+                    hash = hash.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+        }
+        Self {
+            size: meta.len(),
+            mtime_sec: meta.mtime(),
+            mtime_nsec: meta.mtime_nsec(),
+            content_hash: hash,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TextureKey {
     pub path: PathBuf,
     pub filter: TextureFilter,
     pub wrap: TextureWrap,
     pub flip_y: bool,
+    pub fingerprint: TextureFingerprint,
 }
 
 impl TextureKey {
     pub fn from_spec(spec: &TextureSpec) -> Self {
         let canonical = std::fs::canonicalize(&spec.path).unwrap_or_else(|_| spec.path.clone());
+        let fingerprint = TextureFingerprint::from_path(&canonical);
         Self {
             path: canonical,
             filter: spec.filter,
             wrap: spec.wrap,
             flip_y: spec.flip_y,
+            fingerprint,
         }
     }
 }
@@ -1146,6 +1186,11 @@ impl Renderer {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn resolve_target_count(&self) -> usize {
+        self.resolve_targets.len()
+    }
+
     fn ensure_resolve_target(
         &mut self,
         output_name: &str,
@@ -1711,6 +1756,7 @@ mod tests {
             filter,
             wrap: TextureWrap::ClampToEdge,
             flip_y: false,
+            fingerprint: TextureFingerprint::default(),
         }
     }
 
@@ -1743,5 +1789,208 @@ mod tests {
         assert_eq!(pool.release(id1), Some("tex_linear"));
         assert!(pool.acquire(&k1).is_none());
         assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn texture_key_changes_when_file_updated_in_place() {
+        let dir = std::env::temp_dir().join(format!("glwall-texkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("depth.pgm");
+        std::fs::write(&path, b"P5\n2 2\n255\n\x10\x20\x30\x40").unwrap();
+
+        let spec = TextureSpec {
+            path: path.clone(),
+            filter: TextureFilter::Linear,
+            wrap: TextureWrap::ClampToEdge,
+            flip_y: false,
+        };
+        let key1 = TextureKey::from_spec(&spec);
+
+        let mut pool: TexturePoolCore<&'static str> = TexturePoolCore::new();
+        let (id1, _) = pool.insert_or_acquire(key1.clone(), 2, 2, "first");
+        assert_eq!(pool.acquire(&key1), Some(id1));
+
+        // Overwrite in place with different contents of the exact same byte length.
+        std::fs::write(&path, b"P5\n2 2\n255\n\x90\xa0\xb0\xc0").unwrap();
+        let key2 = TextureKey::from_spec(&spec);
+        assert_ne!(
+            key1, key2,
+            "TextureKey must change when file contents change in place"
+        );
+        assert!(
+            pool.acquire(&key2).is_none(),
+            "stale cache entry must not be reused after in-place update"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thousand_image_and_shader_switches_do_not_grow_gpu_objects() {
+        let egl = crate::gpu::egl::EglState::new_test_pbuffer(16, 16).unwrap();
+        let gl = egl.create_glow_context().unwrap();
+        let mut renderer = Renderer::new(gl).unwrap();
+        let mut pool = TexturePool::new();
+        let mut slot0 = MediaSlotGpu::empty();
+
+        let img_a = [200u8, 40, 20, 255].repeat(32 * 32);
+        let img_b = [20u8, 120, 220, 255].repeat(32 * 32);
+        let aux_px = [128u8, 64, 32, 255].repeat(16 * 16);
+
+        let mut current_prog: Option<GlProgram> = None;
+        let mut max_program_id = 0u32;
+        let mut max_texture_id = 0u32;
+        let mut warm_private_dirty_kb: Option<u64> = None;
+
+        for i in 0..1000usize {
+            let mut slot1 = Some(std::mem::replace(&mut slot0, MediaSlotGpu::empty()));
+            let pixels = if i % 2 == 0 { &img_a } else { &img_b };
+            slot0
+                .set_rgba(&renderer.gl, 32, 32, FitMode::Cover, pixels)
+                .unwrap();
+            if let Some(ref tex) = slot0.rgba_tex {
+                max_texture_id = max_texture_id.max(tex.handle.0.get());
+            }
+
+            let shader_src = format!(
+                "uniform sampler2D u_aux;\nuniform float u_mix;\nvec4 wallpaper(vec2 uv) {{\n    vec4 a = sampleWallpaper(uv);\n    vec4 b = texture(u_aux, uv);\n    return mix(a, b, 0.25 + clamp(u_mix, 0.0, 0.5) + {:.6});\n}}",
+                (i % 7) as f32 * 0.0001
+            );
+            let next_prog = GlProgram::compile(&renderer.gl, &shader_src).unwrap();
+            max_program_id = max_program_id.max(next_prog.handle.0.get());
+            if let Some(old_prog) = current_prog.replace(next_prog) {
+                let old_h = old_prog.handle;
+                old_prog.destroy(&renderer.gl);
+                if i % 100 == 0 {
+                    unsafe { renderer.gl.flush() };
+                    assert!(
+                        !unsafe { renderer.gl.is_program(old_h) },
+                        "replaced GL program was not deleted"
+                    );
+                }
+            }
+
+            let tr_prog =
+                GlProgram::compile(&renderer.gl, crate::gpu::shader::BUILTIN_FADE).unwrap();
+            let tr_handle = tr_prog.handle;
+            max_program_id = max_program_id.max(tr_handle.0.get());
+
+            let aux_key = TextureKey {
+                path: PathBuf::from(format!("/virtual/aux_{i}.png")),
+                filter: TextureFilter::Linear,
+                wrap: TextureWrap::ClampToEdge,
+                flip_y: false,
+                fingerprint: TextureFingerprint {
+                    size: 1024,
+                    mtime_sec: i as i64,
+                    mtime_nsec: 0,
+                    content_hash: i as u64,
+                },
+            };
+            let aux_id = pool
+                .insert_rgba(&renderer.gl, aux_key, 16, 16, &aux_px)
+                .unwrap();
+            let aux_handle = pool.texture_info(aux_id).map(|(h, _, _)| h);
+            if let Some(h) = aux_handle {
+                max_texture_id = max_texture_id.max(h.0.get());
+            }
+
+            let mut custom_textures = BTreeMap::new();
+            custom_textures.insert("u_aux".to_string(), aux_id);
+            let mut custom_uniforms = BTreeMap::new();
+            custom_uniforms.insert("u_mix".to_string(), UniformValue::Float(0.2));
+
+            let params = DrawParams {
+                width: 16,
+                height: 16,
+                time_secs: i as f32 * 0.016,
+                delta_secs: 0.016,
+                progress: 0.5,
+                frame_index: i as i32,
+                params: [0.0; 4],
+                output_index: 0,
+                output_name: "switch-test",
+                slot0: &slot0,
+                slot1: slot1.as_ref(),
+                custom_program: current_prog.as_ref(),
+                transition_program: Some(&tr_prog),
+                in_transition: true,
+                custom_textures: &custom_textures,
+                custom_uniforms: &custom_uniforms,
+            };
+            renderer.draw(&params, &pool).unwrap();
+
+            // Promote done: clean up old slot1, transition program, resolve target, and aux tex.
+            let s1_handle = slot1
+                .as_ref()
+                .and_then(|s| s.rgba_tex.as_ref())
+                .map(|t| t.handle);
+            if let Some(s1) = slot1.take() {
+                s1.destroy(&renderer.gl);
+            }
+            tr_prog.destroy(&renderer.gl);
+            pool.release(&renderer.gl, aux_id);
+            renderer.remove_output_cache("switch-test");
+
+            if i % 100 == 0 {
+                unsafe { renderer.gl.flush() };
+                assert!(
+                    !unsafe { renderer.gl.is_program(tr_handle) },
+                    "transition GL program was not deleted"
+                );
+                if let Some(h) = s1_handle {
+                    assert!(
+                        !unsafe { renderer.gl.is_texture(h) },
+                        "replaced slot1 GL texture was not deleted"
+                    );
+                }
+                if let Some(h) = aux_handle {
+                    assert!(
+                        !unsafe { renderer.gl.is_texture(h) },
+                        "released aux GL texture was not deleted"
+                    );
+                }
+            }
+
+            if i == 100 {
+                unsafe { renderer.gl.finish() };
+                warm_private_dirty_kb = read_self_private_dirty_kb();
+            }
+        }
+
+        unsafe { renderer.gl.finish() };
+        assert_eq!(pool.len(), 0);
+        assert_eq!(renderer.resolve_target_count(), 0);
+        assert!(
+            max_program_id < 100,
+            "GL program handles grew without reuse across 1,000 switches: max_program_id={max_program_id}"
+        );
+        assert!(
+            max_texture_id < 100,
+            "GL texture handles grew without reuse across 1,000 switches: max_texture_id={max_texture_id}"
+        );
+        if let (Some(warm), Some(end)) = (warm_private_dirty_kb, read_self_private_dirty_kb()) {
+            let delta = end.saturating_sub(warm);
+            assert!(
+                delta < 16 * 1024,
+                "excessive Private_Dirty growth across 900 switches: warm={warm} kB, end={end} kB (delta={delta} kB)"
+            );
+        }
+
+        if let Some(prog) = current_prog.take() {
+            prog.destroy(&renderer.gl);
+        }
+        slot0.destroy(&renderer.gl);
+        pool.destroy(&renderer.gl);
+        renderer.destroy();
+    }
+
+    fn read_self_private_dirty_kb() -> Option<u64> {
+        let raw = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+        raw.lines().find_map(|line| {
+            let rest = line.strip_prefix("Private_Dirty:")?;
+            rest.split_whitespace().next()?.parse::<u64>().ok()
+        })
     }
 }
