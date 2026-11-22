@@ -1,4 +1,5 @@
 use std::io::{BufReader, Read};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -617,6 +618,7 @@ fn stream_ffmpeg_session(
     let y_len = (width as usize) * (height as usize);
     let uv_len = ((width / 2) as usize) * ((height / 2) as usize) * 2;
     let mut count = 0u64;
+    let mut stderr_nonblocking = false;
     let mut next_deadline = Instant::now();
 
     while !control.should_stop() {
@@ -654,6 +656,15 @@ fn stream_ffmpeg_session(
             uv_plane,
         });
         count += 1;
+        if !stderr_nonblocking {
+            if let Some(ref err_pipe) = stderr {
+                set_nonblocking(err_pipe.as_raw_fd());
+            }
+            stderr_nonblocking = true;
+        }
+        if count.is_multiple_of(60) {
+            drain_stderr_nonblocking(&mut stderr);
+        }
 
         let now = Instant::now();
         if count == 1 || now.saturating_duration_since(next_deadline) > frame_interval * 3 {
@@ -730,6 +741,36 @@ fn read_stderr_snippet(stderr: &mut Option<std::process::ChildStderr>) -> String
     match err_pipe.read(&mut buf) {
         Ok(n) if n > 0 => String::from_utf8_lossy(&buf[..n]).trim().to_string(),
         _ => String::new(),
+    }
+}
+
+fn set_nonblocking(fd: RawFd) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+fn drain_stderr_nonblocking(stderr: &mut Option<std::process::ChildStderr>) {
+    let Some(err_pipe) = stderr.as_mut() else {
+        return;
+    };
+    let mut buf = [0u8; 512];
+    loop {
+        match err_pipe.read(&mut buf) {
+            Ok(0) => {
+                *stderr = None;
+                break;
+            }
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => {
+                *stderr = None;
+                break;
+            }
+        }
     }
 }
 

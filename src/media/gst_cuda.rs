@@ -1,9 +1,9 @@
 //! Optional GStreamer NVDEC backend. Libraries are loaded at runtime so the
 //! regular FFmpeg backend remains available on systems without GStreamer CUDA.
-use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_ulong, c_void};
 use std::path::Path;
 use std::ptr;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -86,12 +86,15 @@ struct Api {
     _video: Library,
     _cuda: Library,
     _glib: Library,
+    _gobject: Library,
     init: unsafe extern "C" fn(Ptr, Ptr, *mut *mut GError) -> c_int,
     parse: unsafe extern "C" fn(*const c_char, *mut *mut GError) -> Ptr,
     get_by_name: unsafe extern "C" fn(Ptr, *const c_char) -> Ptr,
     set_state: unsafe extern "C" fn(Ptr, c_int) -> c_int,
+    get_state: unsafe extern "C" fn(Ptr, *mut c_int, *mut c_int, u64) -> c_int,
     get_bus: unsafe extern "C" fn(Ptr) -> Ptr,
-    pop_filtered: unsafe extern "C" fn(Ptr, c_uint) -> Ptr,
+    bus_pop: unsafe extern "C" fn(Ptr) -> Ptr,
+    bus_set_flushing: unsafe extern "C" fn(Ptr, c_int),
     parse_error: unsafe extern "C" fn(Ptr, *mut *mut GError, *mut *mut c_char),
     seek: unsafe extern "C" fn(Ptr, c_int, c_uint, i64) -> c_int,
     unref_object: unsafe extern "C" fn(Ptr),
@@ -106,8 +109,15 @@ struct Api {
     cuda_sync: unsafe extern "C" fn(Ptr),
     map: unsafe extern "C" fn(Ptr, *mut GstMapInfo, c_uint) -> c_int,
     unmap: unsafe extern "C" fn(Ptr, *mut GstMapInfo),
+    caps_get_size: unsafe extern "C" fn(Ptr) -> c_uint,
+    caps_get_structure: unsafe extern "C" fn(Ptr, c_uint) -> Ptr,
+    structure_get_name: unsafe extern "C" fn(Ptr) -> *const c_char,
+    task_cleanup_all: unsafe extern "C" fn(),
     error_free: unsafe extern "C" fn(*mut GError),
     free: unsafe extern "C" fn(Ptr),
+    set_max_unused_threads: unsafe extern "C" fn(c_int),
+    stop_unused_threads: unsafe extern "C" fn(),
+    signal_connect_data: unsafe extern "C" fn(Ptr, *const c_char, Ptr, Ptr, Ptr, c_int) -> c_ulong,
 }
 
 impl Api {
@@ -118,12 +128,15 @@ impl Api {
             let video = Library::new("libgstvideo-1.0.so.0")?;
             let cuda = Library::new("libgstcuda-1.0.so.0")?;
             let glib = Library::new("libglib-2.0.so.0")?;
+            let gobject = Library::new("libgobject-2.0.so.0")?;
             let init = *gst.get(b"gst_init_check\0")?;
             let parse = *gst.get(b"gst_parse_launch\0")?;
             let get_by_name = *gst.get(b"gst_bin_get_by_name\0")?;
             let set_state = *gst.get(b"gst_element_set_state\0")?;
+            let get_state = *gst.get(b"gst_element_get_state\0")?;
             let get_bus = *gst.get(b"gst_element_get_bus\0")?;
-            let pop_filtered = *gst.get(b"gst_bus_pop_filtered\0")?;
+            let bus_pop = *gst.get(b"gst_bus_pop\0")?;
+            let bus_set_flushing = *gst.get(b"gst_bus_set_flushing\0")?;
             let parse_error = *gst.get(b"gst_message_parse_error\0")?;
             let seek = *gst.get(b"gst_element_seek_simple\0")?;
             let unref_object = *gst.get(b"gst_object_unref\0")?;
@@ -138,20 +151,30 @@ impl Api {
             let cuda_sync = *cuda.get(b"gst_cuda_memory_sync\0")?;
             let map = *gst.get(b"gst_memory_map\0")?;
             let unmap = *gst.get(b"gst_memory_unmap\0")?;
+            let caps_get_size = *gst.get(b"gst_caps_get_size\0")?;
+            let caps_get_structure = *gst.get(b"gst_caps_get_structure\0")?;
+            let structure_get_name = *gst.get(b"gst_structure_get_name\0")?;
+            let task_cleanup_all = *gst.get(b"gst_task_cleanup_all\0")?;
             let error_free = *glib.get(b"g_error_free\0")?;
             let free = *glib.get(b"g_free\0")?;
+            let set_max_unused_threads = *glib.get(b"g_thread_pool_set_max_unused_threads\0")?;
+            let stop_unused_threads = *glib.get(b"g_thread_pool_stop_unused_threads\0")?;
+            let signal_connect_data = *gobject.get(b"g_signal_connect_data\0")?;
             let api = Self {
                 _gst: gst,
                 _app: app,
                 _video: video,
                 _cuda: cuda,
                 _glib: glib,
+                _gobject: gobject,
                 init,
                 parse,
                 get_by_name,
                 set_state,
+                get_state,
                 get_bus,
-                pop_filtered,
+                bus_pop,
+                bus_set_flushing,
                 parse_error,
                 seek,
                 unref_object,
@@ -166,8 +189,15 @@ impl Api {
                 cuda_sync,
                 map,
                 unmap,
+                caps_get_size,
+                caps_get_structure,
+                structure_get_name,
+                task_cleanup_all,
                 error_free,
                 free,
+                set_max_unused_threads,
+                stop_unused_threads,
+                signal_connect_data,
             };
             let mut error = ptr::null_mut();
             if (api.init)(ptr::null_mut(), ptr::null_mut(), &mut error) == 0 {
@@ -175,6 +205,7 @@ impl Api {
                     api.take_error(error, "GStreamer initialization failed")
                 ));
             }
+            (api.set_max_unused_threads)(0);
             Ok(api)
         }
     }
@@ -199,12 +230,80 @@ impl Api {
     }
 }
 
+// GStreamer remains initialized for the life of the process. Keep the
+// loaded libraries alive for all plugin callbacks and retained samples.
+static API: OnceLock<std::result::Result<Arc<Api>, String>> = OnceLock::new();
+static PIPELINE_LOCK: Mutex<usize> = Mutex::new(0);
+
 fn api() -> Result<Arc<Api>> {
-    // GStreamer remains initialized for the life of the process. Keep the
-    // loaded libraries alive for all plugin callbacks and retained samples.
-    static API: LazyLock<std::result::Result<Arc<Api>, String>> =
-        LazyLock::new(|| Api::load().map(Arc::new).map_err(|e| format!("{e:#}")));
-    API.clone().map_err(|e| anyhow!(e))
+    API.get_or_init(|| Api::load().map(Arc::new).map_err(|e| format!("{e:#}")))
+        .clone()
+        .map_err(|e| anyhow!(e))
+}
+
+fn cleanup_idle_locked(api: &Api) {
+    unsafe {
+        (api.task_cleanup_all)();
+        (api.set_max_unused_threads)(0);
+        (api.stop_unused_threads)();
+    }
+}
+
+/// Reclaims idle GStreamer task/pool threads and returns freed pages when no
+/// CUDA video decoder is active. No-op if GStreamer was never initialized.
+pub fn reclaim_idle_resources() {
+    let Some(Ok(api)) = API.get() else {
+        return;
+    };
+    {
+        let active = PIPELINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if *active > 0 {
+            return;
+        }
+        cleanup_idle_locked(api);
+    }
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn active_decoder_count() -> usize {
+    *PIPELINE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn should_autoplug_media_type(media_type: &str) -> bool {
+    !(media_type.starts_with("audio/")
+        || media_type.starts_with("text/")
+        || media_type.starts_with("subpicture/")
+        || media_type.starts_with("application/x-subtitle"))
+}
+
+unsafe extern "C" fn autoplug_continue_cb(
+    _bin: Ptr,
+    _pad: Ptr,
+    caps: Ptr,
+    user_data: Ptr,
+) -> c_int {
+    if caps.is_null() || user_data.is_null() {
+        return 1;
+    }
+    unsafe {
+        let api = &*(user_data as *const Api);
+        if (api.caps_get_size)(caps) == 0 {
+            return 1;
+        }
+        let structure = (api.caps_get_structure)(caps, 0);
+        if structure.is_null() {
+            return 1;
+        }
+        let name_ptr = (api.structure_get_name)(structure);
+        if name_ptr.is_null() {
+            return 1;
+        }
+        let media_type = CStr::from_ptr(name_ptr).to_string_lossy();
+        c_int::from(should_autoplug_media_type(&media_type))
+    }
 }
 
 pub struct MappedCudaFrame {
@@ -392,6 +491,7 @@ pub struct CudaDecoder {
     sink: Ptr,
     bus: Ptr,
     colorspace: ColorSpace,
+    eos_pending: bool,
 }
 
 impl CudaDecoder {
@@ -405,7 +505,7 @@ impl CudaDecoder {
         }
         let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
         let desc = CString::new(format!(
-            "filesrc location=\"{escaped}\" ! decodebin ! video/x-raw(memory:CUDAMemory),format=NV12 ! appsink name=frames max-buffers=2 drop=false sync=false"
+            "filesrc location=\"{escaped}\" ! decodebin name=dec expose-all-streams=false ! video/x-raw(memory:CUDAMemory),format=NV12 ! appsink name=frames max-buffers=2 drop=false sync=false"
         ))?;
         let mut error = ptr::null_mut();
         let pipeline = unsafe { (api.parse)(desc.as_ptr(), &mut error) };
@@ -433,12 +533,31 @@ impl CudaDecoder {
             }
             bail!("CUDA decoder pipeline is missing a sink or bus");
         }
+        let dec = unsafe { (api.get_by_name)(pipeline, c"dec".as_ptr()) };
+        if !dec.is_null() {
+            unsafe {
+                (api.signal_connect_data)(
+                    dec,
+                    c"autoplug-continue".as_ptr(),
+                    autoplug_continue_cb as *const () as Ptr,
+                    Arc::as_ptr(&api) as Ptr,
+                    ptr::null_mut(),
+                    0,
+                );
+                (api.unref_object)(dec);
+            }
+        }
+        {
+            let mut active = PIPELINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            *active += 1;
+        }
         let decoder = Self {
             api,
             pipeline,
             sink,
             bus,
             colorspace,
+            eos_pending: false,
         };
         if unsafe { (decoder.api.set_state)(decoder.pipeline, 4) } == 0 {
             bail!("could not start CUDA decoder pipeline");
@@ -446,15 +565,12 @@ impl CudaDecoder {
         Ok(decoder)
     }
 
-    pub fn pull(&mut self, timeout: Duration) -> Result<Option<CudaFrame>> {
-        let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
-        let sample = unsafe { (self.api.pull)(self.sink, timeout_ns) };
-        if !sample.is_null() {
-            return CudaFrame::from_sample(Arc::clone(&self.api), sample, self.colorspace)
-                .map(Some);
-        }
-        let message = unsafe { (self.api.pop_filtered)(self.bus, 1 | (1 << 1)) };
-        if !message.is_null() {
+    fn drain_bus(&mut self) -> Result<()> {
+        loop {
+            let message = unsafe { (self.api.bus_pop)(self.bus) };
+            if message.is_null() {
+                break;
+            }
             let kind = unsafe { (*(message as *const GstMessageHeader)).ty };
             if kind == (1 << 1) {
                 let mut detail = ptr::null_mut();
@@ -471,9 +587,26 @@ impl CudaDecoder {
                 }
                 bail!("{text}");
             }
+            if kind == 1 {
+                self.eos_pending = true;
+            }
             unsafe {
                 (self.api.unref_mini)(message);
             }
+        }
+        Ok(())
+    }
+
+    pub fn pull(&mut self, timeout: Duration) -> Result<Option<CudaFrame>> {
+        let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
+        let sample = unsafe { (self.api.pull)(self.sink, timeout_ns) };
+        self.drain_bus()?;
+        if !sample.is_null() {
+            return CudaFrame::from_sample(Arc::clone(&self.api), sample, self.colorspace)
+                .map(Some);
+        }
+        if self.eos_pending {
+            self.eos_pending = false;
             // GST_FORMAT_TIME; FLUSH | KEY_UNIT.
             if unsafe { (self.api.seek)(self.pipeline, 3, 1 | 4, 0) } == 0 {
                 bail!("CUDA decoder could not loop video");
@@ -486,10 +619,151 @@ impl CudaDecoder {
 impl Drop for CudaDecoder {
     fn drop(&mut self) {
         unsafe {
+            (self.api.bus_set_flushing)(self.bus, 1);
             (self.api.set_state)(self.pipeline, 1); // GST_STATE_NULL
+            // Wait up to 2s for pad tasks to tear down before releasing refs/task pool.
+            (self.api.get_state)(
+                self.pipeline,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                2_000_000_000,
+            );
             (self.api.unref_object)(self.sink);
             (self.api.unref_object)(self.bus);
             (self.api.unref_object)(self.pipeline);
         }
+        {
+            let mut active = PIPELINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                cleanup_idle_locked(&self.api);
+            }
+        }
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_non_video_media_caps() {
+        assert!(!should_autoplug_media_type("audio/mpeg"));
+        assert!(!should_autoplug_media_type("audio/x-raw"));
+        assert!(!should_autoplug_media_type("text/x-raw"));
+        assert!(!should_autoplug_media_type("subpicture/x-pgs"));
+        assert!(!should_autoplug_media_type("application/x-subtitle"));
+        assert!(should_autoplug_media_type("video/quicktime"));
+        assert!(should_autoplug_media_type("video/x-h264"));
+        assert!(should_autoplug_media_type("video/x-raw"));
+    }
+
+    #[test]
+    #[ignore = "requires an NVIDIA CUDA device, GStreamer nvcodec and ffmpeg"]
+    fn cuda_decoder_reclaims_gst_threads_on_drop_and_reopens() {
+        let path = std::env::temp_dir().join(format!("glwall-gst-drop-{}.mp4", std::process::id()));
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=64x64:r=10:d=0.4",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.4",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to create H.264+AAC fixture");
+
+        {
+            let mut decoder = CudaDecoder::open(&path, ColorSpace::Bt601Tv).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut pulled = false;
+            while std::time::Instant::now() < deadline {
+                if let Some(_frame) = decoder.pull(Duration::from_millis(100)).unwrap() {
+                    pulled = true;
+                    break;
+                }
+            }
+            assert!(pulled, "failed to pull initial CUDA frame");
+        }
+
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        assert!(
+            !maps.contains("libgstfaad"),
+            "audio decoder plugin should not be loaded for video-only playback"
+        );
+
+        // Wait for any sibling CUDA tests sharing this process to finish before
+        // checking process-wide thread reclamation.
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(25);
+        while active_decoder_count() > 0 && std::time::Instant::now() < wait_deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(active_decoder_count(), 0);
+        reclaim_idle_resources();
+
+        let leftover_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let mut leftover = Vec::new();
+        while std::time::Instant::now() < leftover_deadline {
+            leftover.clear();
+            for entry in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+                let comm_path = entry.path().join("comm");
+                if let Ok(comm) = std::fs::read_to_string(comm_path) {
+                    let name = comm.trim();
+                    let is_pool_worker = name
+                        .strip_prefix("pool-")
+                        .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_digit()));
+                    if name.starts_with("multiqueue")
+                        || name.starts_with("qtdemux")
+                        || name.starts_with("typefind")
+                        || is_pool_worker
+                        || name == "cuda-EvtHandlr"
+                    {
+                        leftover.push(name.to_string());
+                    }
+                }
+            }
+            if leftover.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            leftover.is_empty(),
+            "GStreamer threads lingered after drop: {leftover:?}"
+        );
+
+        {
+            let mut reopened = CudaDecoder::open(&path, ColorSpace::Bt601Tv).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut pulled = false;
+            while std::time::Instant::now() < deadline {
+                if let Some(_frame) = reopened.pull(Duration::from_millis(100)).unwrap() {
+                    pulled = true;
+                    break;
+                }
+            }
+            assert!(pulled, "failed to pull CUDA frame after reopen");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -1,6 +1,7 @@
 //! Optional NVIDIA CUDA-to-GLES NV12 transfer. No frame pixels pass through host RAM.
 use std::ffi::{c_int, c_uint, c_void};
 use std::ptr;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use glow::HasContext;
@@ -147,10 +148,19 @@ fn has_unregistered_resources(
     textures.is_some() && resources.contains(&ptr::null_mut())
 }
 
+static CUDA_API: OnceLock<std::result::Result<Arc<Api>, String>> = OnceLock::new();
+
+fn api() -> Result<Arc<Api>> {
+    CUDA_API
+        .get_or_init(|| Api::load().map(Arc::new).map_err(|e| format!("{e:#}")))
+        .clone()
+        .map_err(|e| anyhow!(e))
+}
+
 /// The graphics resources are tied to the current EGL context. The owner must
 /// call `destroy` with that context current before destroying the EGL context.
 pub struct CudaTextures {
-    api: Api,
+    api: Arc<Api>,
     egl_context: *mut c_void,
     cuda_context: ContextHandle,
     textures: Option<[glow::Texture; 2]>,
@@ -161,7 +171,7 @@ pub struct CudaTextures {
 
 impl CudaTextures {
     pub fn new() -> Result<Self> {
-        let api = Api::load()?;
+        let api = api()?;
         let egl_context = unsafe { (api.current_egl)() };
         if egl_context.is_null() {
             bail!("no current EGL context for CUDA interop");
@@ -175,6 +185,15 @@ impl CudaTextures {
             width: 0,
             height: 0,
         })
+    }
+
+    fn release_cuda_context(&mut self) {
+        if !self.cuda_context.is_null() {
+            unsafe {
+                (self.api.object_unref)(self.cuda_context);
+            }
+            self.cuda_context = ptr::null_mut();
+        }
     }
 
     fn push(&self) -> Result<()> {
@@ -216,16 +235,14 @@ impl CudaTextures {
             if let Some(err) = error {
                 return Err(err);
             }
-            unsafe {
-                (self.api.object_unref)(self.cuda_context);
-            }
-            self.cuda_context = ptr::null_mut();
+            self.release_cuda_context();
         }
         if let Some(textures) = self.textures.take() {
             unsafe {
                 for texture in textures {
                     gl.delete_texture(texture);
                 }
+                gl.flush();
             }
         }
         self.width = 0;
@@ -263,13 +280,21 @@ impl CudaTextures {
             if self.cuda_context.is_null() {
                 bail!("failed to retain CUDA context");
             }
-            let y = unsafe { gl.create_texture().map_err(|e| anyhow!("{e}"))? };
+            let y = match unsafe { gl.create_texture() } {
+                Ok(texture) => texture,
+                Err(err) => {
+                    self.release_cuda_context();
+                    return Err(anyhow!("{err}"));
+                }
+            };
             let uv = match unsafe { gl.create_texture() } {
                 Ok(texture) => texture,
                 Err(err) => {
                     unsafe {
                         gl.delete_texture(y);
+                        gl.flush();
                     }
+                    self.release_cuda_context();
                     return Err(anyhow!("{err}"));
                 }
             };

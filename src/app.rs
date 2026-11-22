@@ -76,6 +76,16 @@ impl OutputEntry {
         self.custom_program.as_ref().is_some_and(|p| p.uses_time)
     }
 
+    fn needs_resolve_target(&self) -> bool {
+        if self.in_transition && self.custom_program.is_some() && self.transition_program.is_some()
+        {
+            return true;
+        }
+        self.custom_program.as_ref().is_some_and(|p| {
+            p.assembled.mode == crate::gpu::shader::ShaderMode::Shadertoy && p.uses_ichannel0
+        })
+    }
+
     /// Extracts the GPU-owned resources, leaving `self` free to be torn down.
     fn gpu_parts(&mut self) -> DeferredOutputGpu {
         DeferredOutputGpu {
@@ -145,6 +155,32 @@ fn frame_needs_render(
     apply_pending: bool,
 ) -> bool {
     configured && !frame_pending && !apply_pending && (dirty || continuous)
+}
+
+fn prune_shader_bindings(
+    custom_textures: &mut BTreeMap<String, TextureId>,
+    spec_textures: &mut BTreeMap<String, TextureSpec>,
+    custom_uniforms: &mut BTreeMap<String, UniformValue>,
+    spec_uniforms: &mut BTreeMap<String, UniformValue>,
+    allowed_samplers: &HashSet<String>,
+    allowed_uniforms: &HashSet<String>,
+) -> Vec<TextureId> {
+    let stale_tex_keys: Vec<String> = custom_textures
+        .keys()
+        .filter(|k| !allowed_samplers.contains(k.as_str()))
+        .cloned()
+        .collect();
+    let mut removed_ids = Vec::with_capacity(stale_tex_keys.len());
+    for key in stale_tex_keys {
+        if let Some(id) = custom_textures.remove(&key) {
+            removed_ids.push(id);
+        }
+        spec_textures.remove(&key);
+    }
+    spec_textures.retain(|k, _| allowed_samplers.contains(k.as_str()));
+    custom_uniforms.retain(|k, _| allowed_uniforms.contains(k.as_str()));
+    spec_uniforms.retain(|k, _| allowed_uniforms.contains(k.as_str()));
+    removed_ids
 }
 
 struct CommitWaiter {
@@ -818,6 +854,7 @@ impl AppCore {
         let mut wait_targets: Vec<(String, u64)> = Vec::new();
         let mut max_rev = 0u64;
         let mut keys_to_spawn: Vec<TextureKey> = Vec::new();
+        let mut stopped_animated = false;
 
         for (idx, prep) in prepared {
             self.cancel_output_pending(idx, "superseded by newer apply");
@@ -839,22 +876,35 @@ impl AppCore {
             let mut awaiting_media_gen: Option<u64> = None;
 
             if is_standalone_shader {
-                self.ensure_any_gl_context()?;
-                let gl = &self.renderer.as_ref().unwrap().gl;
+                if let Some(ref r) = self.renderer {
+                    self.outputs[idx].slot0.clear(&r.gl);
+                } else {
+                    self.outputs[idx].slot0 = MediaSlotGpu::empty();
+                }
                 let entry = &mut self.outputs[idx];
-                entry.slot0.try_clear(gl)?;
                 entry.generation += 1;
                 if let Some(job) = entry.job.take() {
+                    stopped_animated |= job.kind.is_animated();
                     job.stop();
                 }
                 if let Some(prev) = entry.prev_job.take() {
+                    stopped_animated |= prev.kind.is_animated();
                     prev.stop();
                 }
-                if let Some(s1) = entry.slot1.take() {
-                    s1.destroy(gl);
-                }
-                if let Some(tr) = entry.transition_program.take() {
-                    tr.destroy(gl);
+                if let Some(ref r) = self.renderer {
+                    if let Some(s1) = entry.slot1.take() {
+                        s1.destroy(&r.gl);
+                    }
+                    if let Some(tr) = entry.transition_program.take() {
+                        tr.destroy(&r.gl);
+                    }
+                } else {
+                    if let Some(s1) = entry.slot1.take() {
+                        self.deferred_slots.push(s1);
+                    }
+                    if let Some(tr) = entry.transition_program.take() {
+                        self.deferred_programs.push(tr);
+                    }
                 }
                 entry.slot0_has_first_frame = false;
                 entry.waiting_target_frame = false;
@@ -874,10 +924,15 @@ impl AppCore {
                     let abs = absolutize_path(Path::new(&m.target));
                     target_override = Some(abs.to_string_lossy().to_string());
                 }
+                let need_resolve = entry.needs_resolve_target();
+                let name = entry.name.clone();
+                if !need_resolve && let Some(ref mut r) = self.renderer {
+                    r.remove_output_cache(&name);
+                }
             } else if let Some((resolved_target, kind, media)) = prep.resolved_media {
                 if prep.transition_prog.is_none() {
                     if let Some(r) = &self.renderer {
-                        self.outputs[idx].slot0.try_clear(&r.gl)?;
+                        self.outputs[idx].slot0.clear(&r.gl);
                     } else {
                         self.outputs[idx].slot0 = MediaSlotGpu::empty();
                     }
@@ -887,6 +942,7 @@ impl AppCore {
                 let generation = entry.generation;
 
                 if let Some(prev) = entry.prev_job.take() {
+                    stopped_animated |= prev.kind.is_animated();
                     prev.stop();
                 }
                 if let Some(old_tr) = entry.transition_program.take()
@@ -925,11 +981,17 @@ impl AppCore {
                     entry.transition_started = None;
                 } else {
                     if let Some(old_job) = entry.job.take() {
+                        stopped_animated |= old_job.kind.is_animated();
                         old_job.stop();
                     }
                     entry.waiting_target_frame = false;
                     entry.in_transition = false;
                     entry.transition_started = None;
+                    let need_resolve = entry.needs_resolve_target();
+                    let name = entry.name.clone();
+                    if !need_resolve && let Some(ref mut r) = self.renderer {
+                        r.remove_output_cache(&name);
+                    }
                 }
 
                 entry.slot0_has_first_frame = false;
@@ -992,6 +1054,11 @@ impl AppCore {
 
         for key in keys_to_spawn {
             decode_texture_async(key, self.media_tx.clone());
+        }
+
+        if stopped_animated {
+            crate::media::gst_cuda::reclaim_idle_resources();
+            unsafe { libc::malloc_trim(0) };
         }
 
         if tx.wait_commit
@@ -1061,7 +1128,7 @@ impl AppCore {
 
         let mut pending = self.outputs[idx].pending_apply.take().unwrap();
 
-        let (shader_changed, persist_now, out_name, spec_snapshot) = {
+        let (shader_changed, needs_resolve, persist_now, out_name, spec_snapshot) = {
             let gl_opt = self.renderer.as_ref().map(|r| &r.gl);
             let entry = &mut self.outputs[idx];
             let mut sh_changed = false;
@@ -1079,26 +1146,53 @@ impl AppCore {
                     if pending.clear_implicit_shader || entry.spec.shader.is_some() {
                         entry.spec.shader = None;
                     }
-                    // With no shader, auxiliary textures have no consumer — release
-                    // every pool ref and drop the spec entries, otherwise a stale
-                    // `u_depth`-style matte stays pinned in VRAM forever. Any
-                    // texture explicitly re-added in this same apply is re-inserted
-                    // by the texture_updates loop below.
+                    // With no shader, auxiliary textures and uniforms have no consumer —
+                    // release every pool ref and drop the spec entries. Any bindings
+                    // explicitly supplied in this same apply are re-inserted below.
+                    let empty = HashSet::new();
+                    let removed = prune_shader_bindings(
+                        &mut entry.custom_textures,
+                        &mut entry.spec.textures,
+                        &mut entry.custom_uniforms,
+                        &mut entry.spec.uniforms,
+                        &empty,
+                        &empty,
+                    );
                     if let Some(gl) = gl_opt {
-                        for (_, old_id) in std::mem::take(&mut entry.custom_textures) {
+                        for old_id in removed {
                             self.texture_pool.release(gl, old_id);
                         }
-                    } else {
-                        entry.custom_textures.clear();
                     }
-                    entry.spec.textures.clear();
                     sh_changed = true;
                 }
                 StagedShader::Set { path, program } => {
+                    let allowed_samplers: HashSet<String> = program
+                        .user_samplers
+                        .iter()
+                        .map(|s| s.name.clone())
+                        .collect();
+                    let allowed_uniforms: HashSet<String> = program
+                        .user_uniforms
+                        .iter()
+                        .map(|u| u.name.clone())
+                        .collect();
                     if let Some(old) = entry.custom_program.replace(*program)
                         && let Some(gl) = gl_opt
                     {
                         old.destroy(gl);
+                    }
+                    let removed = prune_shader_bindings(
+                        &mut entry.custom_textures,
+                        &mut entry.spec.textures,
+                        &mut entry.custom_uniforms,
+                        &mut entry.spec.uniforms,
+                        &allowed_samplers,
+                        &allowed_uniforms,
+                    );
+                    if let Some(gl) = gl_opt {
+                        for old_id in removed {
+                            self.texture_pool.release(gl, old_id);
+                        }
                     }
                     let canonical = path.to_string_lossy().to_string();
                     entry.custom_shader_path = Some(path);
@@ -1167,12 +1261,19 @@ impl AppCore {
 
             (
                 sh_changed,
+                entry.needs_resolve_target(),
                 pending.persist,
                 entry.name.clone(),
                 entry.spec.clone(),
             )
         };
 
+        if shader_changed
+            && !needs_resolve
+            && let Some(ref mut r) = self.renderer
+        {
+            r.remove_output_cache(&out_name);
+        }
         if persist_now {
             self.persisted.outputs.insert(out_name, spec_snapshot);
             self.save_state();
@@ -1201,6 +1302,8 @@ impl AppCore {
                         "no GL context available to upload aux texture {}",
                         key.path.display()
                     );
+                    drop(pixels);
+                    unsafe { libc::malloc_trim(0) };
                     for i in 0..self.outputs.len() {
                         if self.outputs[i]
                             .pending_apply
@@ -1213,26 +1316,27 @@ impl AppCore {
                     return;
                 }
                 let gl = &self.renderer.as_ref().unwrap().gl;
-                let base_id =
-                    match self
-                        .texture_pool
-                        .insert_rgba(gl, key.clone(), width, height, &pixels)
-                    {
-                        Ok(id) => id,
-                        Err(err) => {
-                            tracing::error!("aux texture upload failed: {err}");
-                            for i in 0..self.outputs.len() {
-                                if self.outputs[i]
-                                    .pending_apply
-                                    .as_ref()
-                                    .is_some_and(|p| p.pending_keys.contains(&key))
-                                {
-                                    self.cancel_output_pending(i, &err.to_string());
-                                }
+                let insert_res =
+                    self.texture_pool
+                        .insert_rgba(gl, key.clone(), width, height, &pixels);
+                drop(pixels);
+                unsafe { libc::malloc_trim(0) };
+                let base_id = match insert_res {
+                    Ok(id) => id,
+                    Err(err) => {
+                        tracing::error!("aux texture upload failed: {err}");
+                        for i in 0..self.outputs.len() {
+                            if self.outputs[i]
+                                .pending_apply
+                                .as_ref()
+                                .is_some_and(|p| p.pending_keys.contains(&key))
+                            {
+                                self.cancel_output_pending(i, &err.to_string());
                             }
-                            return;
                         }
-                    };
+                        return;
+                    }
+                };
 
                 // First waiter adopts base_id (refcount=1 already); additional outputs acquire().
                 let mut used_base = false;
@@ -1635,19 +1739,31 @@ impl AppCore {
         }
 
         if promote_done {
-            let gl = &self.renderer.as_ref().unwrap().gl;
-            let entry = &mut self.outputs[idx];
-            entry.in_transition = false;
-            entry.transition_started = None;
-            if let Some(prev_job) = entry.prev_job.take() {
-                prev_job.stop();
+            let mut stopped_animated = false;
+            let (out_name, need_resolve) = {
+                let gl = &self.renderer.as_ref().unwrap().gl;
+                let entry = &mut self.outputs[idx];
+                entry.in_transition = false;
+                entry.transition_started = None;
+                if let Some(prev_job) = entry.prev_job.take() {
+                    stopped_animated = prev_job.kind.is_animated();
+                    prev_job.stop();
+                }
+                if let Some(s1) = entry.slot1.take() {
+                    s1.destroy(gl);
+                }
+                if let Some(tr) = entry.transition_program.take() {
+                    tr.destroy(gl);
+                }
+                (entry.name.clone(), entry.needs_resolve_target())
+            };
+            if !need_resolve && let Some(ref mut r) = self.renderer {
+                r.remove_output_cache(&out_name);
             }
-            if let Some(s1) = entry.slot1.take() {
-                s1.destroy(gl);
+            if stopped_animated {
+                crate::media::gst_cuda::reclaim_idle_resources();
             }
-            if let Some(tr) = entry.transition_program.take() {
-                tr.destroy(gl);
-            }
+            unsafe { libc::malloc_trim(0) };
         }
 
         let (out_name, revision, frame_index, swapped_ok) = {
@@ -2067,10 +2183,13 @@ impl AppCore {
     }
 
     fn teardown_output_entry(&mut self, mut entry: OutputEntry) {
+        let mut stopped_animated = false;
         if let Some(job) = entry.job.take() {
+            stopped_animated |= job.kind.is_animated();
             job.stop();
         }
         if let Some(prev) = entry.prev_job.take() {
+            stopped_animated |= prev.kind.is_animated();
             prev.stop();
         }
         let bound = self.bind_cleanup_gl_context().is_ok()
@@ -2087,6 +2206,10 @@ impl AppCore {
             let gpu = entry.gpu_parts();
             entry.surface.teardown(&self.egl);
             self.deferred_outputs.push(gpu);
+            if stopped_animated {
+                crate::media::gst_cuda::reclaim_idle_resources();
+            }
+            unsafe { libc::malloc_trim(0) };
             return;
         }
         self.drain_deferred_gpu();
@@ -2102,6 +2225,10 @@ impl AppCore {
             r.destroy();
         }
         entry.surface.teardown(&self.egl);
+        if stopped_animated {
+            crate::media::gst_cuda::reclaim_idle_resources();
+            unsafe { libc::malloc_trim(0) };
+        }
     }
 
     fn shutdown(&mut self) {
@@ -2298,6 +2425,8 @@ impl WaylandAppSink for AppCore {
         };
         let entry = self.outputs.remove(idx);
         let name = entry.name.clone();
+        self.pause.drop_output(&name);
+        self.fullscreen_outputs.remove(&name);
         self.fail_commit_waiters_for_output(&name, "surface closed before commit");
         self.teardown_output_entry(entry);
         self.sync_shader_watcher();
@@ -2339,12 +2468,35 @@ impl WaylandAppSink for AppCore {
     }
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn configure_glibc_allocator() {
+    const M_MMAP_THRESHOLD: libc::c_int = -3;
+    const M_ARENA_MAX: libc::c_int = -8;
+    // Keep worker/GStreamer allocations inside the main arena and mmap
+    // large frame buffers directly so free() + malloc_trim(0) return RSS
+    // to the OS even when `glwall daemon` starts without a systemd drop-in.
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        unsafe {
+            libc::mallopt(M_ARENA_MAX, 1);
+        }
+    }
+    if std::env::var_os("MALLOC_MMAP_THRESHOLD_").is_none() {
+        unsafe {
+            libc::mallopt(M_MMAP_THRESHOLD, 256 * 1024);
+        }
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn configure_glibc_allocator() {}
+
 pub fn run_daemon(
     config_path: Option<PathBuf>,
     socket_path: PathBuf,
     no_restore: bool,
     no_persist: bool,
 ) -> Result<()> {
+    configure_glibc_allocator();
     let config = Config::load_or_default(config_path.as_deref())?;
     let persist_enabled = config.persist_state && !no_persist;
     let state_path = default_state_path();
@@ -2500,7 +2652,11 @@ pub fn run_daemon(
 
 #[cfg(test)]
 mod tests {
-    use super::frame_needs_render;
+    use super::{frame_needs_render, prune_shader_bindings};
+    use crate::gpu::renderer::TextureId;
+    use crate::gpu::uniforms::{TextureFilter, TextureSpec, TextureWrap, UniformValue};
+    use std::collections::{BTreeMap, HashSet};
+    use std::path::PathBuf;
 
     #[test]
     fn pending_wallpaper_keeps_previous_frame_until_commit() {
@@ -2514,5 +2670,63 @@ mod tests {
         assert!(!frame_needs_render(true, true, true, true, false));
         assert!(!frame_needs_render(false, false, true, true, false));
         assert!(!frame_needs_render(true, false, false, false, false));
+    }
+
+    #[test]
+    fn shader_switch_prunes_stale_textures_and_uniforms() {
+        let mut custom_textures = BTreeMap::new();
+        custom_textures.insert("u_depth".to_string(), TextureId(10));
+        custom_textures.insert("u_shared".to_string(), TextureId(20));
+
+        let mk_spec = |name: &str| TextureSpec {
+            path: PathBuf::from(format!("/tmp/{name}.png")),
+            filter: TextureFilter::Linear,
+            wrap: TextureWrap::ClampToEdge,
+            flip_y: false,
+        };
+        let mut spec_textures = BTreeMap::new();
+        spec_textures.insert("u_depth".to_string(), mk_spec("depth"));
+        spec_textures.insert("u_shared".to_string(), mk_spec("shared"));
+
+        let mut custom_uniforms = BTreeMap::new();
+        custom_uniforms.insert("u_parallaxStrength".to_string(), UniformValue::Float(0.05));
+        custom_uniforms.insert("u_keep".to_string(), UniformValue::Float(1.0));
+        let mut spec_uniforms = custom_uniforms.clone();
+
+        let allowed_samplers: HashSet<String> = ["u_shared".to_string()].into_iter().collect();
+        let allowed_uniforms: HashSet<String> = ["u_keep".to_string()].into_iter().collect();
+
+        let removed = prune_shader_bindings(
+            &mut custom_textures,
+            &mut spec_textures,
+            &mut custom_uniforms,
+            &mut spec_uniforms,
+            &allowed_samplers,
+            &allowed_uniforms,
+        );
+        assert_eq!(removed, vec![TextureId(10)]);
+        assert!(!custom_textures.contains_key("u_depth"));
+        assert!(!spec_textures.contains_key("u_depth"));
+        assert_eq!(custom_textures.get("u_shared"), Some(&TextureId(20)));
+        assert!(spec_textures.contains_key("u_shared"));
+        assert!(!custom_uniforms.contains_key("u_parallaxStrength"));
+        assert!(!spec_uniforms.contains_key("u_parallaxStrength"));
+        assert!(custom_uniforms.contains_key("u_keep"));
+        assert!(spec_uniforms.contains_key("u_keep"));
+
+        let empty = HashSet::new();
+        let cleared = prune_shader_bindings(
+            &mut custom_textures,
+            &mut spec_textures,
+            &mut custom_uniforms,
+            &mut spec_uniforms,
+            &empty,
+            &empty,
+        );
+        assert_eq!(cleared, vec![TextureId(20)]);
+        assert!(custom_textures.is_empty());
+        assert!(spec_textures.is_empty());
+        assert!(custom_uniforms.is_empty());
+        assert!(spec_uniforms.is_empty());
     }
 }

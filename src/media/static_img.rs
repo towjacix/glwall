@@ -24,7 +24,7 @@ pub fn decode_rgba_image(path: &Path, flip_y: bool) -> Result<(u32, u32, Vec<u8>
     } else {
         let img = image::open(path)
             .with_context(|| format!("failed to decode image {}", path.display()))?;
-        let rgba = img.to_rgba8();
+        let rgba = img.into_rgba8();
         let (w, h) = rgba.dimensions();
         (w, h, rgba.into_raw())
     };
